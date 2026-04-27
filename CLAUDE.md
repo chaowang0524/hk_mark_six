@@ -67,4 +67,5 @@ predictor.py → ranked candidates with confidence scores
 - **Ensemble option** — weighted average of model probability outputs for final prediction.
 
 ## Note:
-This project is for education purpose to learn statistics, based on the idea of the lottery result is not uniformly distributed and predictable.
+- This project is for education purpose to learn statistics, based on the idea of the lottery result is not uniformly distributed and predictable.
+- Do not add the signature by 'Claude Opus 4.7 <noreply@anthropic.com>' in the commit message
