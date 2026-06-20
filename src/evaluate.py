@@ -14,14 +14,18 @@ from pathlib import Path
 import joblib
 import numpy as np
 import pandas as pd
+import time
+
 from sklearn.metrics import (
     confusion_matrix,
+    log_loss,
     precision_score,
     recall_score,
     top_k_accuracy_score,
 )
 
 from models import (
+    EXTRA_MODEL_REGISTRY,
     MODELS_DIR,
     TEST_FRACTION,
     _chronological_split,
@@ -34,6 +38,8 @@ from preprocessing import POOL
 
 REPORT_PATH = Path("data/reports/evaluation.md")
 CONFUSION_DIR = Path("data/reports/confusion")
+WALK_FORWARD_REPORT_PATH = Path("data/reports/walk_forward.md")
+WALK_FORWARD_PREDS_PATH = Path("data/reports/walk_forward_predictions.csv")
 
 EXTRA_TOP_K = (1, 3, 5, 10)
 UNIFORM_EXTRA_BASELINE = {k: k / 49 for k in EXTRA_TOP_K}
@@ -266,6 +272,158 @@ def evaluate() -> Path:
     REPORT_PATH.write_text("\n".join(lines))
     print(f"Evaluation report → {REPORT_PATH}")
     return REPORT_PATH
+
+
+def _proba_to_49(clf, x_row) -> np.ndarray:
+    """Map a classifier's predict_proba to a length-49 vector indexed by 0..48,
+    handling the case where some classes were absent from the training prefix."""
+    raw = clf.predict_proba(x_row)[0]
+    classes = clf.classes_.astype(int)
+    out = np.zeros(49)
+    out[classes] = raw
+    return out
+
+
+def walk_forward_evaluate(
+    n_test: int = 200,
+    stride: int = 20,
+    model_names: tuple[str, ...] = ("rf", "xgb", "lr"),
+) -> Path:
+    """Walk-forward backtest: for each of the last `n_test` draws, train on
+    all prior draws and predict the next. Headline metric is log-loss vs the
+    uniform baseline — top-k alone is too noisy across 49 classes.
+
+    `stride` controls how often we retrain. With stride=K, we retrain once,
+    predict the next K draws with the same model, then retrain. The lag
+    between train cut-off and prediction draw is at most K-1 — small relative
+    to the training window — but it cuts wall-clock by ~K×.
+    """
+    for name in model_names:
+        if name not in EXTRA_MODEL_REGISTRY:
+            raise ValueError(f"Unknown model '{name}'. Choose from {list(EXTRA_MODEL_REGISTRY)}")
+
+    X, y = _load_features_extra()
+    T = len(X)
+    if n_test >= T:
+        raise ValueError(f"n_test={n_test} must be < total rows {T}")
+    start = T - n_test
+
+    print(
+        f"Walk-forward backtest: n_test={n_test}, stride={stride}, "
+        f"models={list(model_names)}"
+    )
+    print(
+        f"Train on rows [0..t-1], predict row t, for t in [{start}..{T - 1}]. "
+        f"Retrain every {stride} draws ({(n_test + stride - 1) // stride} retrains × "
+        f"{len(model_names)} models = {((n_test + stride - 1) // stride) * len(model_names)} fits)\n"
+    )
+
+    probas = {name: np.zeros((n_test, 49)) for name in model_names}
+    current: dict[str, object] = {}
+
+    for i, t in enumerate(range(start, T)):
+        if i % stride == 0:
+            t0 = time.time()
+            X_tr, y_tr = X.iloc[:t], y.iloc[:t]
+            for name in model_names:
+                clf = EXTRA_MODEL_REGISTRY[name]()
+                clf.fit(X_tr, y_tr)
+                current[name] = clf
+            print(
+                f"  retrained at t={t} ({i + 1}/{n_test} draws done, "
+                f"{time.time() - t0:.1f}s for {len(model_names)} models)"
+            )
+        x_row = X.iloc[t : t + 1]
+        for name in model_names:
+            probas[name][i] = _proba_to_49(current[name], x_row)
+
+    y_arr = y.iloc[start:].to_numpy()
+    labels = list(range(49))
+    uniform = np.full((n_test, 49), 1.0 / 49)
+    uniform_ll = log_loss(y_arr, uniform, labels=labels)
+    uni_topk = {k: k / 49 for k in (1, 3, 5, 10)}
+
+    lines: list[str] = []
+
+    def w(s: str = "") -> None:
+        lines.append(s)
+
+    w("# Walk-Forward Backtest")
+    w()
+    w(
+        f"Method: for each of the last **{n_test}** draws, train on all prior draws "
+        f"and predict the next. Retrain every **{stride}** draws."
+    )
+    w()
+    w(f"Uniform baseline log-loss = -log(1/49) = **{uniform_ll:.4f}**.")
+    w(
+        "Log-loss is the headline metric: top-k accuracy alone can look better "
+        "than uniform from finite-sample noise, log-loss is harder to game."
+    )
+    w()
+    w("| Model | log-loss | Δ vs uniform | top-1 | top-3 | top-5 | top-10 |")
+    w("|-------|----------|--------------|-------|-------|-------|--------|")
+    w(
+        f"| uniform | {uniform_ll:.4f} | 0.0000 | "
+        f"{uni_topk[1]:.4f} | {uni_topk[3]:.4f} | {uni_topk[5]:.4f} | {uni_topk[10]:.4f} |"
+    )
+
+    pred_rows: list[dict] = []
+
+    for name in model_names:
+        p = probas[name]
+        p_clip = np.clip(p, 1e-12, 1.0)
+        p_clip = p_clip / p_clip.sum(axis=1, keepdims=True)
+        ll = log_loss(y_arr, p_clip, labels=labels)
+        topk = {
+            k: top_k_accuracy_score(y_arr, p, labels=labels, k=k)
+            for k in (1, 3, 5, 10)
+        }
+        delta = ll - uniform_ll
+        marker = "✅" if delta < 0 else "❌"
+        w(
+            f"| {name} | {ll:.4f} | {delta:+.4f} {marker} | "
+            f"{topk[1]:.4f} | {topk[3]:.4f} | {topk[5]:.4f} | {topk[10]:.4f} |"
+        )
+
+    w()
+    w("**How to read this**")
+    w()
+    w(
+        "- `Δ vs uniform < 0` means the model is better than guessing — the model "
+        "concentrates probability mass on the actual outcome more often than 1/49."
+    )
+    w(
+        "- `Δ vs uniform ≥ 0` means the model is worse: it confidently picked the "
+        "wrong number often enough to lose to a flat prior. This is the expected "
+        "result for a fair lottery."
+    )
+    w(
+        "- top-k vs the `k/49` baseline can look favourable from noise — only trust "
+        "log-loss as evidence of real signal."
+    )
+    w()
+
+    # Per-draw predictions for inspection
+    for i, t in enumerate(range(start, T)):
+        row = {
+            "row_idx": int(t),
+            "actual": int(y_arr[i]) + 1,
+        }
+        for name in model_names:
+            p = probas[name][i]
+            top1 = int(np.argmax(p))
+            row[f"{name}_top1_num"] = top1 + 1
+            row[f"{name}_top1_prob"] = float(p[top1])
+            row[f"{name}_actual_prob"] = float(p[int(y_arr[i])])
+        pred_rows.append(row)
+
+    WALK_FORWARD_REPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    WALK_FORWARD_REPORT_PATH.write_text("\n".join(lines))
+    pd.DataFrame(pred_rows).to_csv(WALK_FORWARD_PREDS_PATH, index=False)
+    print(f"\nWalk-forward report → {WALK_FORWARD_REPORT_PATH}")
+    print(f"Per-draw predictions → {WALK_FORWARD_PREDS_PATH}")
+    return WALK_FORWARD_REPORT_PATH
 
 
 if __name__ == "__main__":

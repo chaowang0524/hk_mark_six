@@ -21,34 +21,99 @@ def main() -> None:
     sub.add_parser("preprocess", help="Build lagged features → data/features.csv")
     sub.add_parser("analyze", help="Write statistical report to data/reports/")
 
-    p_train = sub.add_parser("train", help="Train ML models")
+    p_update = sub.add_parser(
+        "update",
+        help="Scrape latest draws → retrain all models on full history → predict next draw",
+    )
+    p_update.add_argument(
+        "--model",
+        default="all",
+        choices=["rf", "xgb", "lr", "all"],
+        help="Which model(s) to retrain (default: all)",
+    )
+    p_update.add_argument("--top", type=int, default=10, help="Top-N extra candidates in prediction")
+    p_update.add_argument(
+        "--penalty", type=float, default=0.0, metavar="STRENGTH",
+        help="Recency penalty passed through to predict (0 = disabled)",
+    )
+    p_update.add_argument(
+        "--penalize-last",
+        type=float,
+        nargs="?",
+        const=0.5,
+        default=None,
+        metavar="FACTOR",
+        help="Multiply the last draw's extra number probability by FACTOR (0=exclude, 1=no change). Omit FACTOR to use 0.5.",
+    )
+
+    p_train = sub.add_parser("train", help="Train extra-number models")
     p_train.add_argument(
         "--model", default="all", choices=["rf", "xgb", "lr", "all"]
     )
     p_train.add_argument(
-        "--target", default="both", choices=["extra", "main", "both"],
-        help="Which target to train (default: both)",
+        "--full",
+        action="store_true",
+        help="Train on the entire dataset (no held-out test set). "
+        "Use after evaluating with the default chronological split.",
     )
 
     sub.add_parser("evaluate", help="Backtest + compare models")
 
+    p_wf = sub.add_parser(
+        "walk-forward",
+        help="Honest backtest: retrain on [0..t-1] and predict draw t for the last N draws",
+    )
+    p_wf.add_argument("--n-test", type=int, default=200, help="Trailing draws to backtest")
+    p_wf.add_argument("--stride", type=int, default=20, help="Retrain every N draws")
+    p_wf.add_argument(
+        "--model", default="all", choices=["rf", "xgb", "lr", "all"]
+    )
+
     p_pred = sub.add_parser(
-        "predict", help="Predict next draw's 6 main numbers + 1 extra number"
+        "predict", help="Predict next draw's extra number"
     )
     p_pred.add_argument("--top", type=int, default=10, help="Top-N extra candidates")
-    p_pred.add_argument(
-        "--top-main", type=int, default=10, help="Top-N main number candidates"
-    )
     p_pred.add_argument(
         "--model",
         default="xgb",
         choices=["rf", "xgb", "lr", "ensemble"],
         help="Model to use (ensemble averages all available)",
     )
+    p_pred.add_argument(
+        "--penalty",
+        type=float,
+        default=0.0,
+        metavar="STRENGTH",
+        help="Recency penalty strength 0–1 (e.g. 0.5). Discounts numbers that "
+             "appeared as extra recently: drawn 1 draw ago → ×STRENGTH, "
+             "2 draws ago → ×√STRENGTH, fading over 10 draws. 0 = disabled.",
+    )
+    p_pred.add_argument(
+        "--penalize-last",
+        type=float,
+        nargs="?",
+        const=0.5,
+        default=None,
+        metavar="FACTOR",
+        help="Multiply the last draw's extra number probability by FACTOR (0=exclude, 1=no change). Omit FACTOR to use 0.5.",
+    )
 
     args = parser.parse_args()
 
-    if args.command == "scrape":
+    if args.command == "update":
+        from scraper import scrape
+        from preprocessing import preprocess
+        from models import train
+        from predictor import predict
+        print("=== Step 1/3: Scraping latest draws ===")
+        scrape()
+        print("\n=== Step 2/3: Retraining models on full history ===")
+        train(args.model, full=True)
+        print("\n=== Step 3/3: Predicting next draw ===")
+        predict(model_name="ensemble" if args.model == "all" else args.model,
+                top_extra=args.top, penalty=args.penalty, penalize_last=args.penalize_last)
+
+    elif args.command == "scrape":
         from scraper import scrape
         scrape()
     elif args.command == "preprocess":
@@ -59,13 +124,20 @@ def main() -> None:
         run_analysis()
     elif args.command == "train":
         from models import train
-        train(args.model, args.target)
+        train(args.model, full=args.full)
     elif args.command == "evaluate":
         from evaluate import evaluate
         evaluate()
+    elif args.command == "walk-forward":
+        from evaluate import walk_forward_evaluate
+        names = ("rf", "xgb", "lr") if args.model == "all" else (args.model,)
+        walk_forward_evaluate(
+            n_test=args.n_test, stride=args.stride, model_names=names
+        )
     elif args.command == "predict":
         from predictor import predict
-        predict(model_name=args.model, top_extra=args.top, top_main=args.top_main)
+        predict(model_name=args.model, top_extra=args.top, penalty=args.penalty,
+                penalize_last=args.penalize_last)
 
 
 if __name__ == "__main__":

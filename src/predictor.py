@@ -19,6 +19,7 @@ from models import MODELS_DIR
 from preprocessing import POOL, build_features, load_raw
 
 REPORTS_DIR = Path(__file__).resolve().parent.parent / "data" / "reports"
+PREDICTION_LOG = Path(__file__).resolve().parent.parent / "data" / "prediction_log.csv"
 
 EXTRA_MODEL_FILES = {
     "rf": MODELS_DIR / "extra_rf.joblib",
@@ -106,6 +107,55 @@ def _get_extra_proba(model_name: str, X_next: pd.DataFrame) -> tuple[np.ndarray,
     return clf.predict_proba(X_next)[0], model_name
 
 
+
+def _apply_prediction_penalty(
+    proba: np.ndarray,
+    strength: float = 0.5,
+    window: int = 5,
+) -> np.ndarray:
+    """Discount numbers that appeared in recent predictions.
+
+    Reads the last `window` rows from prediction_log.csv. For each row,
+    numbers that were ranked higher and predicted more recently get a
+    steeper discount using:
+
+        factor = strength ^ (1 / (age * rank))
+
+    where age=1 is the most recent prediction and rank=1 is top-1.
+
+    Examples with strength=0.5:
+      rank=1, age=1 → 0.50  (top-1 last prediction — steepest)
+      rank=1, age=2 → 0.71
+      rank=5, age=1 → 0.87
+      rank=10, age=1 → 0.93 (nearly no effect)
+
+    Result is renormalised so probabilities still sum to 1.
+    """
+    if not PREDICTION_LOG.exists():
+        return proba
+
+    df = pd.read_csv(PREDICTION_LOG)
+    if df.empty:
+        return proba
+
+    recent = df.tail(window).reset_index(drop=True)
+    proba = proba.copy()
+
+    for i, row in recent.iterrows():
+        age = len(recent) - i  # most recent row → age=1
+        for rank, token in enumerate(str(row["predictions"]).split(), start=1):
+            try:
+                num = int(token.split("(")[0])
+            except ValueError:
+                continue
+            proba[num - 1] *= strength ** (1.0 / (age * rank))
+
+    total = proba.sum()
+    if total > 0:
+        proba /= total
+    return proba
+
+
 def _get_main_proba(model_name: str, X_next: pd.DataFrame) -> tuple[np.ndarray, str]:
     """Returns shape (49,) — P(number k in main draw), k=1..49."""
     if model_name == "ensemble":
@@ -166,30 +216,90 @@ def _supporting_stats_main(raw: pd.DataFrame) -> dict[int, dict]:
     return stats
 
 
-def predict(model_name: str = "xgb", top_extra: int = 10, top_main: int = 10) -> None:
+def _check_model_staleness(model_name: str, raw: pd.DataFrame) -> None:
+    """Warn if saved models are stale or were trained with a held-out test split."""
+    import json
+    from models import MODELS_DIR, TEST_FRACTION
+
+    names = _available_models("extra") if model_name == "ensemble" else [model_name]
+    latest_draw = raw["date"].iloc[-1]
+    warned = False
+
+    for n in names:
+        path = EXTRA_MODEL_FILES.get(n)
+        if not (path and path.exists()):
+            continue
+
+        # Check if trained with full data or a held-out split
+        metrics_path = MODELS_DIR / f"extra_{n}_metrics.json"
+        trained_full = False
+        if metrics_path.exists():
+            meta = json.loads(metrics_path.read_text())
+            trained_full = meta.get("trained_on") == "full"
+
+        # Count draws that occurred after the model file was last written
+        trained_at = pd.Timestamp(path.stat().st_mtime, unit="s", tz="UTC").tz_localize(None)
+        draws_since = int((raw["date"] > trained_at).sum())
+
+        if not trained_full:
+            holdout = int(len(raw) * TEST_FRACTION)
+            print(
+                f"  WARNING [{n}]: trained with a {TEST_FRACTION:.0%} test split — "
+                f"the most recent ~{holdout} draws were held out and NOT used in training."
+            )
+            warned = True
+        elif draws_since > 0:
+            print(
+                f"  WARNING [{n}]: {draws_since} draw(s) since last retrain "
+                f"(latest draw: {latest_draw.date()}) are not in the training data."
+            )
+            warned = True
+
+    if warned:
+        print("  → Run `python main.py update` to scrape + retrain on all draws + predict.\n")
+
+
+def _apply_last_draw_penalty(proba: np.ndarray, raw: pd.DataFrame, factor: float) -> tuple[np.ndarray, int]:
+    """Scale the last draw's extra number probability by factor, renormalise, return (proba, number)."""
+    last_extra = int(raw["extra"].iloc[-1])
+    proba = proba.copy()
+    proba[last_extra - 1] *= factor
+    total = proba.sum()
+    if total > 0:
+        proba /= total
+    return proba, last_extra
+
+
+def predict(model_name: str = "xgb", top_extra: int = 10, penalty: float = 0.0,
+            penalize_last: float | None = None) -> None:
     row, next_date, raw = _next_draw_feature_row()
+    _check_model_staleness(model_name, raw)
     X_next = _align_features(row)
 
     extra_proba, extra_used = _get_extra_proba(model_name, X_next)
-    main_proba, main_used = _get_main_proba(model_name, X_next)
+
+    if 0.0 < penalty < 1.0:
+        extra_proba = _apply_prediction_penalty(extra_proba, strength=penalty)
+
+    last_extra_penalized: int | None = None
+    if penalize_last is not None:
+        extra_proba, last_extra_penalized = _apply_last_draw_penalty(extra_proba, raw, factor=penalize_last)
 
     extra_order = np.argsort(-extra_proba)[:top_extra]
-    main_order = np.argsort(-main_proba)[:top_main]
 
     extra_stats = _supporting_stats_extra(raw)
-    main_stats = _supporting_stats_main(raw)
 
     en = _render_combined_report(
-        main_order, main_proba, main_stats,
         extra_order, extra_proba, extra_stats,
-        next_date, raw, main_used, extra_used,
-        lang="en",
+        next_date, raw, extra_used,
+        lang="en", penalty=penalty,
+        last_extra_penalized=last_extra_penalized, penalize_last_factor=penalize_last,
     )
     zh = _render_combined_report(
-        main_order, main_proba, main_stats,
         extra_order, extra_proba, extra_stats,
-        next_date, raw, main_used, extra_used,
-        lang="zh",
+        next_date, raw, extra_used,
+        lang="zh", penalty=penalty,
+        last_extra_penalized=last_extra_penalized, penalize_last_factor=penalize_last,
     )
 
     print(en)
@@ -207,17 +317,16 @@ def predict(model_name: str = "xgb", top_extra: int = 10, top_main: int = 10) ->
 
 
 def _render_combined_report(
-    main_order: np.ndarray,
-    main_proba: np.ndarray,
-    main_stats: dict[int, dict],
     extra_order: np.ndarray,
     extra_proba: np.ndarray,
     extra_stats: dict[int, dict],
     next_date: pd.Timestamp,
     raw: pd.DataFrame,
-    main_used: str,
     extra_used: str,
     lang: str,
+    penalty: float = 0.0,
+    last_extra_penalized: int | None = None,
+    penalize_last_factor: float | None = None,
 ) -> str:
     lines: list[str] = []
 
@@ -230,7 +339,11 @@ def _render_combined_report(
         w(sep)
         w(f"Mark Six Prediction — {next_date.date()}")
         w(f"History: {len(raw)} draws through {raw['date'].iloc[-1].date()}")
-        w(f"Models: main={main_used}  extra={extra_used}")
+        w(f"Model: {extra_used}")
+        if penalty > 0.0:
+            w(f"Recency penalty: {penalty} (discounts numbers drawn recently as extra)")
+        if last_extra_penalized is not None:
+            w(f"Last-draw penalty: extra number {last_extra_penalized} scaled by {penalize_last_factor} (then renormalised)")
         w(sep)
         w()
         w(f"TOP {len(extra_order)} SUGGESTED EXTRA NUMBERS")
@@ -246,24 +359,17 @@ def _render_combined_report(
                 f"{conf_pct:<10.2f}{s['pct']:<10.2f}{s['gap']:<6}{s['recent30']}"
             )
         w()
-        w(f"---------- MAIN NUMBERS (top {len(main_order)} candidates) ----------")
-        w(f"{'Rank':<5}{'Num':<6}{'P(appear)':<12}{'HistPct':<10}{'Last30'}")
-        w("-" * 42)
-        for rank, idx in enumerate(main_order, start=1):
-            n = int(idx) + 1
-            s = main_stats[n]
-            w(f"{rank:<5}{n:<6}{main_proba[idx]:<12.4f}{s['pct']:<10.2f}{s['recent30']}")
-        w()
-        w(
-            f"Uniform baseline: main P(appear)=6/49={6/49:.4f},  "
-            f"extra=1/49={1/49:.4f}"
-        )
+        w(f"Uniform baseline: extra=1/49={1/49:.4f}")
         w("Lottery draws are independent random events.")
     else:
         w(sep)
         w(f"马克六号预测 — {next_date.date()}")
         w(f"历史数据: {len(raw)} 期,截至 {raw['date'].iloc[-1].date()}")
-        w(f"模型: 正码={main_used}  特别号={extra_used}")
+        w(f"模型: {extra_used}")
+        if penalty > 0.0:
+            w(f"近期惩罚系数: {penalty}（对近期出现为特别号的号码降权）")
+        if last_extra_penalized is not None:
+            w(f"上期惩罚: 上期特别号 {last_extra_penalized} 概率乘以 {penalize_last_factor}（再归一化）")
         w(sep)
         w()
         w(f"特别号推荐前 {len(extra_order)} 名")
@@ -279,18 +385,7 @@ def _render_combined_report(
                 f"{conf_pct:<10.2f}{s['pct']:<10.2f}{s['gap']:<6}{s['recent30']}"
             )
         w()
-        w(f"---------- 正码候选(前 {len(main_order)} 名) ----------")
-        for rank, idx in enumerate(main_order, start=1):
-            n = int(idx) + 1
-            s = main_stats[n]
-            w(
-                f"第 {rank} 名  号码 {n:<2}  "
-                f"出现概率 {main_proba[idx]:.4f}  "
-                f"历史占比 {s['pct']:.2f}%  "
-                f"近30期 {s['recent30']} 次"
-            )
-        w()
-        w(f"均匀基准: 正码出现概率=6/49={6/49:.4f},  特别号=1/49={1/49:.4f}")
+        w(f"均匀基准: 特别号=1/49={1/49:.4f}")
         w("彩票开奖为独立随机事件,仅供参考。")
 
     return "\n".join(lines)

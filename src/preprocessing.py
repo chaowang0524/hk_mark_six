@@ -20,6 +20,15 @@ NUM_MIN = 1
 NUM_MAX = 49
 POOL = list(range(NUM_MIN, NUM_MAX + 1))
 ROLLING_WINDOWS = (10, 30, 100)
+EXTRA_LONG_WINDOWS = (300, 500)
+MAIN_FREQ_WINDOWS = (100,)  # main-as-main is weak signal; keep only the long window
+EWM_ALPHAS = (0.05,)
+EXTRA_LAGS = tuple(range(1, 11))
+WAS_MAIN_LAST_K = (1, 3, 5)
+MARKOV_WINDOW = 100
+LAST_K_STATS = 10
+TREND_SHORT_W = 10
+TREND_LONG_W = 100
 
 # Chinese New Year (month, day) for each calendar year — used to assign draws
 # that fall before CNY to the previous zodiac year.
@@ -69,6 +78,57 @@ def _gap_since_last(presence: np.ndarray) -> np.ndarray:
         appeared = np.where(presence[t] > 0)[0]
         last_idx[appeared] = t
     return out
+
+
+def _ewm_matrix(presence_shifted: np.ndarray, alpha: float) -> np.ndarray:
+    return (
+        pd.DataFrame(presence_shifted)
+        .ewm(alpha=alpha, adjust=False)
+        .mean()
+        .to_numpy()
+    )
+
+
+def _markov_window(extras_1based: np.ndarray, window: int) -> np.ndarray:
+    """For row t with j = extras[t-1], count of past transition pairs
+    (extras[i], extras[i+1]) with extras[i] == j, broken out per next value k,
+    over the last `window` pairs i ∈ [max(0, t-1-window) .. t-2]."""
+    T = len(extras_1based)
+    M = np.zeros((NUM_MAX, NUM_MAX), dtype=float)
+    out = np.zeros((T, NUM_MAX), dtype=float)
+    for t in range(T):
+        if t >= 1:
+            j = int(extras_1based[t - 1]) - 1
+            out[t] = M[j]
+        if t >= 1:
+            ji = int(extras_1based[t - 1]) - 1
+            ki = int(extras_1based[t]) - 1
+            M[ji, ki] += 1
+            old = t - 1 - window
+            if old >= 0:
+                jo = int(extras_1based[old]) - 1
+                ko = int(extras_1based[old + 1]) - 1
+                M[jo, ko] -= 1
+    return out
+
+
+def _last_k_extra_stats(extras_1based: np.ndarray, k: int) -> pd.DataFrame:
+    T = len(extras_1based)
+    mean = np.full(T, np.nan)
+    odd = np.full(T, np.nan)
+    le25 = np.full(T, np.nan)
+    for t in range(k, T):
+        window = extras_1based[t - k : t]
+        mean[t] = window.mean()
+        odd[t] = (window % 2 == 1).mean()
+        le25[t] = float((window <= 25).sum())
+    return pd.DataFrame(
+        {
+            f"extra_last{k}_mean": mean,
+            f"extra_last{k}_odd_ratio": odd,
+            f"extra_last{k}_le25_count": le25,
+        }
+    )
 
 
 def _zodiac_year_index(date: pd.Timestamp) -> int:
@@ -142,7 +202,6 @@ def _prev_draw_stats(df: pd.DataFrame) -> pd.DataFrame:
             "prev_main_min": np.concatenate([[np.nan], mins[:-1]]),
             "prev_main_max": np.concatenate([[np.nan], maxs[:-1]]),
             "prev_main_consec": np.concatenate([[np.nan], consec[:-1]]),
-            "prev_extra": np.concatenate([[np.nan], df["extra"].to_numpy()[:-1]]),
         }
     )
     return prev
@@ -168,20 +227,87 @@ def build_features(df: pd.DataFrame | None = None) -> pd.DataFrame:
     shifted_main = np.vstack([np.zeros((1, NUM_MAX)), main_presence[:-1]])
 
     feature_frames: list[pd.DataFrame] = []
+    extra_freqs: dict[int, np.ndarray] = {}
 
-    for w in ROLLING_WINDOWS:
+    # Extra-number rolling frequency: short + long windows
+    for w in ROLLING_WINDOWS + EXTRA_LONG_WINDOWS:
         ec = _rolling_count_matrix(shifted_extra, w)
+        extra_freqs[w] = ec
         feature_frames.append(
             pd.DataFrame(ec, columns=[f"extra_freq_w{w}_n{k}" for k in POOL])
         )
+
+    # All-time cumulative count (uses only past data because of shifted_extra)
+    extra_all = np.cumsum(shifted_extra, axis=0)
+    feature_frames.append(
+        pd.DataFrame(extra_all, columns=[f"extra_freq_wall_n{k}" for k in POOL])
+    )
+
+    # Exponentially-weighted extra frequency
+    for alpha in EWM_ALPHAS:
+        tag = f"{int(round(alpha * 100)):02d}"
+        ew = _ewm_matrix(shifted_extra, alpha)
+        feature_frames.append(
+            pd.DataFrame(ew, columns=[f"extra_ewm_a{tag}_n{k}" for k in POOL])
+        )
+
+    # Hot/cold trend: short-window rate minus long-window rate
+    trend = extra_freqs[TREND_SHORT_W] / TREND_SHORT_W - extra_freqs[TREND_LONG_W] / TREND_LONG_W
+    feature_frames.append(
+        pd.DataFrame(trend, columns=[f"extra_trend_n{k}" for k in POOL])
+    )
+
+    # Z-score of long-window count vs. uniform-extra null hypothesis
+    expected = TREND_LONG_W / NUM_MAX
+    std = np.sqrt(TREND_LONG_W * (1.0 / NUM_MAX) * ((NUM_MAX - 1) / NUM_MAX))
+    zscore = (extra_freqs[TREND_LONG_W] - expected) / std
+    feature_frames.append(
+        pd.DataFrame(zscore, columns=[f"extra_zscore_n{k}" for k in POOL])
+    )
+
+    # Main-number rolling frequency (long window only — weak signal otherwise)
+    for w in MAIN_FREQ_WINDOWS:
         mc = _rolling_count_matrix(shifted_main, w)
         feature_frames.append(
             pd.DataFrame(mc, columns=[f"main_freq_w{w}_n{k}" for k in POOL])
         )
 
-    gap = _gap_since_last(shifted_extra)
+    # Gaps: extra and main
+    extra_gap = _gap_since_last(shifted_extra)
     feature_frames.append(
-        pd.DataFrame(gap, columns=[f"extra_gap_n{k}" for k in POOL])
+        pd.DataFrame(extra_gap, columns=[f"extra_gap_n{k}" for k in POOL])
+    )
+    main_gap = _gap_since_last(shifted_main)
+    feature_frames.append(
+        pd.DataFrame(main_gap, columns=[f"main_gap_n{k}" for k in POOL])
+    )
+
+    # Co-occurrence: did number k appear as a main number in any of last K draws
+    for K in WAS_MAIN_LAST_K:
+        rc = _rolling_count_matrix(shifted_main, K)
+        binary = (rc >= 1).astype(float)
+        feature_frames.append(
+            pd.DataFrame(binary, columns=[f"was_main_last_{K}_n{k}" for k in POOL])
+        )
+
+    # Recent extras: raw lags 1..10 + summary stats over last 10
+    extras_arr = extra.astype(float)
+    lag_cols: dict[str, np.ndarray] = {}
+    for lag in EXTRA_LAGS:
+        arr = np.full(T, np.nan)
+        if T - lag > 0:
+            arr[lag:] = extras_arr[: T - lag]
+        lag_cols[f"extra_lag_{lag}"] = arr
+    feature_frames.append(pd.DataFrame(lag_cols))
+    feature_frames.append(_last_k_extra_stats(extras_arr, LAST_K_STATS))
+
+    # Markov-style transition row: P(extra=k | prev_extra) over last 100 pairs
+    markov = _markov_window(extra, MARKOV_WINDOW)
+    feature_frames.append(
+        pd.DataFrame(
+            markov,
+            columns=[f"prev_extra_to_n{k}_freq_w{MARKOV_WINDOW}" for k in POOL],
+        )
     )
 
     feature_frames.append(_prev_draw_stats(df))
@@ -192,7 +318,6 @@ def build_features(df: pd.DataFrame | None = None) -> pd.DataFrame:
             {
                 "dow": df["date"].dt.dayofweek.to_numpy(),
                 "month": df["date"].dt.month.to_numpy(),
-                "year": df["date"].dt.year.to_numpy(),
             }
         )
     )
