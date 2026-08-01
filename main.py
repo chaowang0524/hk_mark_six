@@ -43,7 +43,13 @@ def main() -> None:
         const=0.5,
         default=None,
         metavar="FACTOR",
-        help="Multiply the last draw's extra number probability by FACTOR (0=exclude, 1=no change). Omit FACTOR to use 0.5.",
+        help="Penalise the last 3 extra numbers with a linearly fading factor starting at FACTOR (0=exclude, 1=no change). Omit FACTOR to use 0.5.",
+    )
+    p_update.add_argument(
+        "--date",
+        default=None,
+        metavar="YYYY-MM-DD",
+        help="Override the guessed next-draw date passed through to predict.",
     )
 
     p_train = sub.add_parser("train", help="Train extra-number models")
@@ -95,7 +101,23 @@ def main() -> None:
         const=0.5,
         default=None,
         metavar="FACTOR",
-        help="Multiply the last draw's extra number probability by FACTOR (0=exclude, 1=no change). Omit FACTOR to use 0.5.",
+        help="Penalise the last 3 extra numbers with a linearly fading factor starting at FACTOR (0=exclude, 1=no change). Omit FACTOR to use 0.5.",
+    )
+    p_pred.add_argument(
+        "--wildcard",
+        action="store_true",
+        help="Show only the model's top 5, plus a separately-labelled 'wildcard' 5 "
+        "echoing whichever numbers scored highest across reports issued 2 months ago "
+        "(excludes anything already in the model's own top list). For fun only — "
+        "draws are independent, this is not additional model signal.",
+    )
+    p_pred.add_argument(
+        "--date",
+        default=None,
+        metavar="YYYY-MM-DD",
+        help="Override the guessed next-draw date (default: next Tue/Thu/Sat after "
+        "the latest scraped draw). Use this when the real HKJC calendar deviates "
+        "from the usual cadence.",
     )
 
     args = parser.parse_args()
@@ -111,7 +133,8 @@ def main() -> None:
         train(args.model, full=True)
         print("\n=== Step 3/3: Predicting next draw ===")
         predict(model_name="ensemble" if args.model == "all" else args.model,
-                top_extra=args.top, penalty=args.penalty, penalize_last=args.penalize_last)
+                top_extra=args.top, penalty=args.penalty, penalize_last=args.penalize_last,
+                date=args.date)
 
     elif args.command == "scrape":
         from scraper import scrape
@@ -137,7 +160,7 @@ def main() -> None:
     elif args.command == "predict":
         from predictor import predict
         predict(model_name=args.model, top_extra=args.top, penalty=args.penalty,
-                penalize_last=args.penalize_last)
+                penalize_last=args.penalize_last, wildcard=args.wildcard, date=args.date)
 
 
 if __name__ == "__main__":

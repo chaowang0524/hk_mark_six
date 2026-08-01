@@ -56,7 +56,6 @@ EXTRA_MODEL_REGISTRY: dict[str, Callable] = {
                     LogisticRegression(
                         max_iter=2000,
                         solver="lbfgs",
-                        n_jobs=-1,
                         random_state=42,
                         C=0.01,
                     ),

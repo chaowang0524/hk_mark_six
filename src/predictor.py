@@ -8,6 +8,7 @@ supporting statistics.
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -46,16 +47,38 @@ def _available_models(target: str) -> list[str]:
     return [n for n, p in files.items() if p.exists()]
 
 
-def _next_draw_feature_row() -> tuple[pd.Series, pd.Timestamp, pd.DataFrame]:
-    """Return (feature row, predicted draw date, raw history)."""
+def _next_draw_feature_row(override_date: str | None = None) -> tuple[pd.Series, pd.Timestamp, pd.DataFrame]:
+    """Return (feature row, predicted draw date, raw history).
+
+    By default the draw date is guessed as the next Tue/Thu/Sat after the
+    latest scraped draw. Pass `override_date` (e.g. "2026-07-20") to pin it
+    explicitly — needed when the real HKJC calendar deviates from the usual
+    cadence, or when raw_draws.csv hasn't been rescraped yet.
+    """
     raw = load_raw()
     last_date = raw["date"].iloc[-1]
-    draw_days = {1, 3, 5}  # Tue/Thu/Sat
-    next_date = last_date
-    for _ in range(7):
-        next_date = next_date + pd.Timedelta(days=1)
-        if next_date.dayofweek in draw_days:
-            break
+
+    if override_date is not None:
+        next_date = pd.Timestamp(override_date)
+        if next_date <= last_date:
+            raise ValueError(
+                f"--date {next_date.date()} is not after the latest scraped draw "
+                f"({last_date.date()}); run `python main.py scrape` first if your "
+                "data is stale."
+            )
+        if next_date.dayofweek not in {1, 3, 5}:
+            print(
+                f"  NOTE: {next_date.date()} is a {next_date.strftime('%A')} — "
+                "not a regular Mark Six draw day (Tue/Thu/Sat). Proceeding anyway "
+                "since --date was explicitly given.\n"
+            )
+    else:
+        draw_days = {1, 3, 5}  # Tue/Thu/Sat
+        next_date = last_date
+        for _ in range(7):
+            next_date = next_date + pd.Timedelta(days=1)
+            if next_date.dayofweek in draw_days:
+                break
     placeholder = pd.DataFrame(
         [
             {
@@ -259,20 +282,65 @@ def _check_model_staleness(model_name: str, raw: pd.DataFrame) -> None:
         print("  → Run `python main.py update` to scrape + retrain on all draws + predict.\n")
 
 
-def _apply_last_draw_penalty(proba: np.ndarray, raw: pd.DataFrame, factor: float) -> tuple[np.ndarray, int]:
-    """Scale the last draw's extra number probability by factor, renormalise, return (proba, number)."""
-    last_extra = int(raw["extra"].iloc[-1])
+def _apply_last_draw_penalty(
+    proba: np.ndarray, raw: pd.DataFrame, factor: float, lookback: int = 3
+) -> tuple[np.ndarray, list[tuple[int, float]]]:
+    """Penalise the last `lookback` extra numbers with a linearly fading factor.
+
+    The most recent draw gets `factor`; each older draw is linearly interpolated
+    toward 1.0 (no penalty) in equal steps.  E.g. factor=0.5, lookback=3:
+        t-1 → 0.50,  t-2 → 0.67,  t-3 → 0.83
+    """
+    extras = raw["extra"].iloc[-lookback:].tolist()
     proba = proba.copy()
-    proba[last_extra - 1] *= factor
+    penalized: list[tuple[int, float]] = []
+    n = len(extras)
+    for i, extra in enumerate(reversed(extras)):
+        # i=0 is the most recent; linearly fade toward 1.0
+        f = factor + (1.0 - factor) * i / lookback
+        num = int(extra)
+        proba[num - 1] *= f
+        penalized.append((num, round(f, 4)))
     total = proba.sum()
     if total > 0:
         proba /= total
-    return proba, last_extra
+    return proba, penalized
+
+
+_REPORT_CUTOFF_RE = re.compile(r"History:\s*\d+\s*draws through (\d{4}-\d{2}-\d{2})")
+_REPORT_ROW_RE = re.compile(
+    r"^\s*(\d{1,2})\s+(\d{1,2})\s+([\d.]+)\s+[\d.]+\s+[\d.]+\s+\d+\s+\d+\s*$", re.M
+)
+
+
+def _echo_scores_for_month(year: int, month: int) -> dict[int, float]:
+    """Sum each number's raw confidence across every saved report cut off in year-month.
+
+    This "echoes" whatever the model was recommending two months ago — it carries
+    no new predictive information (draws are independent), it's a labelled wildcard
+    heuristic, not a claim about the model's confidence in this draw.
+    """
+    scores: dict[int, float] = {}
+    if not REPORTS_DIR.exists():
+        return scores
+    for f in sorted(REPORTS_DIR.glob("predict_*.txt")):
+        text = f.read_text(encoding="utf-8")
+        m = _REPORT_CUTOFF_RE.search(text)
+        if not m:
+            continue
+        cy, cm, _ = m.group(1).split("-")
+        if int(cy) != year or int(cm) != month:
+            continue
+        for rank, num, conf in _REPORT_ROW_RE.findall(text)[:10]:
+            n = int(num)
+            scores[n] = scores.get(n, 0.0) + float(conf)
+    return scores
 
 
 def predict(model_name: str = "xgb", top_extra: int = 10, penalty: float = 0.0,
-            penalize_last: float | None = None) -> None:
-    row, next_date, raw = _next_draw_feature_row()
+            penalize_last: float | None = None, wildcard: bool = False,
+            date: str | None = None) -> None:
+    row, next_date, raw = _next_draw_feature_row(override_date=date)
     _check_model_staleness(model_name, raw)
     X_next = _align_features(row)
 
@@ -281,7 +349,7 @@ def predict(model_name: str = "xgb", top_extra: int = 10, penalty: float = 0.0,
     if 0.0 < penalty < 1.0:
         extra_proba = _apply_prediction_penalty(extra_proba, strength=penalty)
 
-    last_extra_penalized: int | None = None
+    last_extra_penalized: list[tuple[int, float]] | None = None
     if penalize_last is not None:
         extra_proba, last_extra_penalized = _apply_last_draw_penalty(extra_proba, raw, factor=penalize_last)
 
@@ -289,17 +357,30 @@ def predict(model_name: str = "xgb", top_extra: int = 10, penalty: float = 0.0,
 
     extra_stats = _supporting_stats_extra(raw)
 
+    wildcard_info = None
+    if wildcard:
+        target = next_date.normalize().replace(day=1) - pd.DateOffset(months=2)
+        echo = _echo_scores_for_month(target.year, target.month)
+        excluded = {int(i) + 1 for i in extra_order}
+        ranked_echo = sorted(
+            ((n, s) for n, s in echo.items() if n not in excluded),
+            key=lambda item: -item[1],
+        )[:5]
+        wildcard_info = {"month": f"{target.year}-{target.month:02d}", "picks": ranked_echo}
+
     en = _render_combined_report(
         extra_order, extra_proba, extra_stats,
         next_date, raw, extra_used,
         lang="en", penalty=penalty,
         last_extra_penalized=last_extra_penalized, penalize_last_factor=penalize_last,
+        wildcard_info=wildcard_info,
     )
     zh = _render_combined_report(
         extra_order, extra_proba, extra_stats,
         next_date, raw, extra_used,
         lang="zh", penalty=penalty,
         last_extra_penalized=last_extra_penalized, penalize_last_factor=penalize_last,
+        wildcard_info=wildcard_info,
     )
 
     print(en)
@@ -325,8 +406,9 @@ def _render_combined_report(
     extra_used: str,
     lang: str,
     penalty: float = 0.0,
-    last_extra_penalized: int | None = None,
+    last_extra_penalized: list[tuple[int, float]] | None = None,
     penalize_last_factor: float | None = None,
+    wildcard_info: dict | None = None,
 ) -> str:
     lines: list[str] = []
 
@@ -334,6 +416,17 @@ def _render_combined_report(
         lines.append(s)
 
     sep = "=" * 60
+    model_order = extra_order[:5] if wildcard_info is not None else extra_order
+    total_conf = extra_proba.sum()
+
+    def model_row(rank: int, idx) -> str:
+        n = int(idx) + 1
+        s = extra_stats[n]
+        conf_pct = extra_proba[idx] / total_conf * 100
+        return (
+            f"{rank:<5}{n:<6}{extra_proba[idx]:<12.4f}"
+            f"{conf_pct:<10.2f}{s['pct']:<10.2f}{s['gap']:<6}{s['recent30']}"
+        )
 
     if lang == "en":
         w(sep)
@@ -343,24 +436,39 @@ def _render_combined_report(
         if penalty > 0.0:
             w(f"Recency penalty: {penalty} (discounts numbers drawn recently as extra)")
         if last_extra_penalized is not None:
-            w(f"Last-draw penalty: extra number {last_extra_penalized} scaled by {penalize_last_factor} (then renormalised)")
+            parts = ", ".join(f"{num}×{f}" for num, f in last_extra_penalized)
+            w(f"Last-draw penalty: {parts} (linear, renormalised)")
         w(sep)
         w()
-        w(f"TOP {len(extra_order)} SUGGESTED EXTRA NUMBERS")
+        w(f"TOP {len(model_order)} SUGGESTED EXTRA NUMBERS (model)")
         w(f"{'Rank':<5}{'Num':<6}{'Confidence':<12}{'Conf%':<10}{'HistPct':<10}{'Gap':<6}{'Last30'}")
         w("-" * 55)
-        total_conf = extra_proba.sum()
-        for rank, idx in enumerate(extra_order, start=1):
-            n = int(idx) + 1
-            s = extra_stats[n]
-            conf_pct = extra_proba[idx] / total_conf * 100
-            w(
-                f"{rank:<5}{n:<6}{extra_proba[idx]:<12.4f}"
-                f"{conf_pct:<10.2f}{s['pct']:<10.2f}{s['gap']:<6}{s['recent30']}"
-            )
+        for rank, idx in enumerate(model_order, start=1):
+            w(model_row(rank, idx))
         w()
         w(f"Uniform baseline: extra=1/49={1/49:.4f}")
         w("Lottery draws are independent random events.")
+        if wildcard_info is not None:
+            w()
+            w(sep)
+            w(
+                f"WILDCARD {len(wildcard_info['picks'])} — echo of {wildcard_info['month']} "
+                "predictions (for fun, not a model signal)"
+            )
+            w(
+                "These numbers ranked highest by summed confidence across all reports "
+                f"issued in {wildcard_info['month']}, excluding anything already in the "
+                "model's top list above. Draws are independent — this recycles old picks, "
+                "it does not predict this draw."
+            )
+            w(f"{'Rank':<5}{'Num':<6}{'EchoScore':<12}{'HistPct':<10}{'Gap':<6}{'Last30'}")
+            w("-" * 55)
+            for rank, (n, score) in enumerate(wildcard_info["picks"], start=1):
+                s = extra_stats[n]
+                w(
+                    f"{rank:<5}{n:<6}{score:<12.4f}"
+                    f"{s['pct']:<10.2f}{s['gap']:<6}{s['recent30']}"
+                )
     else:
         w(sep)
         w(f"马克六号预测 — {next_date.date()}")
@@ -369,24 +477,38 @@ def _render_combined_report(
         if penalty > 0.0:
             w(f"近期惩罚系数: {penalty}（对近期出现为特别号的号码降权）")
         if last_extra_penalized is not None:
-            w(f"上期惩罚: 上期特别号 {last_extra_penalized} 概率乘以 {penalize_last_factor}（再归一化）")
+            parts = "、".join(f"{num}×{f}" for num, f in last_extra_penalized)
+            w(f"近期惩罚: {parts}（线性衰减，再归一化）")
         w(sep)
         w()
-        w(f"特别号推荐前 {len(extra_order)} 名")
+        w(f"特别号推荐前 {len(model_order)} 名（模型）")
         w(f"{'排名':<5}{'号码':<6}{'置信度':<12}{'置信%':<10}{'历史占比':<10}{'间隔':<6}{'近30期'}")
         w("-" * 55)
-        total_conf = extra_proba.sum()
-        for rank, idx in enumerate(extra_order, start=1):
-            n = int(idx) + 1
-            s = extra_stats[n]
-            conf_pct = extra_proba[idx] / total_conf * 100
-            w(
-                f"{rank:<5}{n:<6}{extra_proba[idx]:<12.4f}"
-                f"{conf_pct:<10.2f}{s['pct']:<10.2f}{s['gap']:<6}{s['recent30']}"
-            )
+        for rank, idx in enumerate(model_order, start=1):
+            w(model_row(rank, idx))
         w()
         w(f"均匀基准: 特别号=1/49={1/49:.4f}")
         w("彩票开奖为独立随机事件,仅供参考。")
+        if wildcard_info is not None:
+            w()
+            w(sep)
+            w(
+                f"彩蛋 {len(wildcard_info['picks'])} 个 — 回声自 {wildcard_info['month']} "
+                "的预测（纯属娱乐，非模型信号）"
+            )
+            w(
+                "这些号码是在排除模型本期前列号码后，按"
+                f"{wildcard_info['month']}期间所有报告置信度总和排序取前列。"
+                "彩票开奖为独立随机事件——此列表只是重现旧预测，并非对本期的预测。"
+            )
+            w(f"{'排名':<5}{'号码':<6}{'回声分':<12}{'历史占比':<10}{'间隔':<6}{'近30期'}")
+            w("-" * 55)
+            for rank, (n, score) in enumerate(wildcard_info["picks"], start=1):
+                s = extra_stats[n]
+                w(
+                    f"{rank:<5}{n:<6}{score:<12.4f}"
+                    f"{s['pct']:<10.2f}{s['gap']:<6}{s['recent30']}"
+                )
 
     return "\n".join(lines)
 

@@ -69,3 +69,4 @@ predictor.py → ranked candidates with confidence scores
 ## Note:
 - This project is for education purpose to learn statistics, based on the idea of the lottery result is not uniformly distributed and predictable.
 - Do not add the signature by 'Claude Opus 4.7 <noreply@anthropic.com>' in the commit message
+- When explaining, use simple language, avoid using jargon to explain jargons.
