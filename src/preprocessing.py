@@ -21,14 +21,16 @@ NUM_MAX = 49
 POOL = list(range(NUM_MIN, NUM_MAX + 1))
 ROLLING_WINDOWS = (10, 30, 100)
 EXTRA_LONG_WINDOWS = (300, 500)
-MAIN_FREQ_WINDOWS = (100,)  # main-as-main is weak signal; keep only the long window
+MAIN_FREQ_WINDOWS = (10, 30, 100, 300, 500)
 EWM_ALPHAS = (0.05,)
 EXTRA_LAGS = tuple(range(1, 11))
-WAS_MAIN_LAST_K = (1, 3, 5)
+MAIN_LAGS = tuple(range(1, 11))
+WAS_MAIN_LAST_K = (1, 3, 5, 10)
 MARKOV_WINDOW = 100
 LAST_K_STATS = 10
 TREND_SHORT_W = 10
 TREND_LONG_W = 100
+MAIN_DRAW_SIZE = 6
 
 # Chinese New Year (month, day) for each calendar year — used to assign draws
 # that fall before CNY to the previous zodiac year.
@@ -109,6 +111,28 @@ def _markov_window(extras_1based: np.ndarray, window: int) -> np.ndarray:
                 jo = int(extras_1based[old]) - 1
                 ko = int(extras_1based[old + 1]) - 1
                 M[jo, ko] -= 1
+    return out
+
+
+def _main_markov_window(main_presence: np.ndarray, window: int) -> np.ndarray:
+    """For row t, sum over the (up to 6) numbers that were main numbers in
+    draw t-1 of each candidate's co-occurrence count as a *next-draw* main
+    number, using only transitions from the last `window` consecutive
+    draw-pairs i -> i+1 with i in [max(0, t-1-window) .. t-2]."""
+    T, K = main_presence.shape
+    M = np.zeros((K, K), dtype=float)
+    out = np.zeros((T, K), dtype=float)
+    for t in range(T):
+        if t >= 1:
+            prev_idx = np.where(main_presence[t - 1] > 0)[0]
+            out[t] = M[prev_idx].sum(axis=0)
+            cur_idx = np.where(main_presence[t] > 0)[0]
+            M[np.ix_(prev_idx, cur_idx)] += 1
+            old = t - 1 - window
+            if old >= 0:
+                old_prev_idx = np.where(main_presence[old] > 0)[0]
+                old_cur_idx = np.where(main_presence[old + 1] > 0)[0]
+                M[np.ix_(old_prev_idx, old_cur_idx)] -= 1
     return out
 
 
@@ -265,12 +289,43 @@ def build_features(df: pd.DataFrame | None = None) -> pd.DataFrame:
         pd.DataFrame(zscore, columns=[f"extra_zscore_n{k}" for k in POOL])
     )
 
-    # Main-number rolling frequency (long window only — weak signal otherwise)
+    # Main-number rolling frequency: short + long windows (mirrors extra treatment)
+    main_freqs: dict[int, np.ndarray] = {}
     for w in MAIN_FREQ_WINDOWS:
         mc = _rolling_count_matrix(shifted_main, w)
+        main_freqs[w] = mc
         feature_frames.append(
             pd.DataFrame(mc, columns=[f"main_freq_w{w}_n{k}" for k in POOL])
         )
+
+    # All-time cumulative main-number count
+    main_all = np.cumsum(shifted_main, axis=0)
+    feature_frames.append(
+        pd.DataFrame(main_all, columns=[f"main_freq_wall_n{k}" for k in POOL])
+    )
+
+    # Exponentially-weighted main-number frequency
+    for alpha in EWM_ALPHAS:
+        tag = f"{int(round(alpha * 100)):02d}"
+        mew = _ewm_matrix(shifted_main, alpha)
+        feature_frames.append(
+            pd.DataFrame(mew, columns=[f"main_ewm_a{tag}_n{k}" for k in POOL])
+        )
+
+    # Hot/cold trend: short-window rate minus long-window rate, as a main number
+    main_trend = main_freqs[TREND_SHORT_W] / TREND_SHORT_W - main_freqs[TREND_LONG_W] / TREND_LONG_W
+    feature_frames.append(
+        pd.DataFrame(main_trend, columns=[f"main_trend_n{k}" for k in POOL])
+    )
+
+    # Z-score of long-window main count vs. uniform-main null (p = 6/49 per draw)
+    p_main = MAIN_DRAW_SIZE / NUM_MAX
+    main_expected = TREND_LONG_W * p_main
+    main_std = np.sqrt(TREND_LONG_W * p_main * (1 - p_main))
+    main_zscore = (main_freqs[TREND_LONG_W] - main_expected) / main_std
+    feature_frames.append(
+        pd.DataFrame(main_zscore, columns=[f"main_zscore_n{k}" for k in POOL])
+    )
 
     # Gaps: extra and main
     extra_gap = _gap_since_last(shifted_extra)
@@ -301,12 +356,33 @@ def build_features(df: pd.DataFrame | None = None) -> pd.DataFrame:
     feature_frames.append(pd.DataFrame(lag_cols))
     feature_frames.append(_last_k_extra_stats(extras_arr, LAST_K_STATS))
 
+    # Recent main draws: sorted 6-number lags 1..10 (mirrors extra_lag_*, one
+    # column per lag per sorted position since main draws have 6 numbers)
+    mains_sorted = np.sort(df[num_cols].to_numpy(), axis=1)
+    main_lag_cols: dict[str, np.ndarray] = {}
+    for lag in MAIN_LAGS:
+        arr = np.full((T, MAIN_DRAW_SIZE), np.nan)
+        if T - lag > 0:
+            arr[lag:] = mains_sorted[: T - lag]
+        for j in range(MAIN_DRAW_SIZE):
+            main_lag_cols[f"main_lag_{lag}_pos{j + 1}"] = arr[:, j]
+    feature_frames.append(pd.DataFrame(main_lag_cols))
+
     # Markov-style transition row: P(extra=k | prev_extra) over last 100 pairs
     markov = _markov_window(extra, MARKOV_WINDOW)
     feature_frames.append(
         pd.DataFrame(
             markov,
             columns=[f"prev_extra_to_n{k}_freq_w{MARKOV_WINDOW}" for k in POOL],
+        )
+    )
+
+    # Markov-style transition row: co-occurrence freq of prev main numbers -> k
+    main_markov = _main_markov_window(main_presence, MARKOV_WINDOW)
+    feature_frames.append(
+        pd.DataFrame(
+            main_markov,
+            columns=[f"prev_main_to_n{k}_freq_w{MARKOV_WINDOW}" for k in POOL],
         )
     )
 

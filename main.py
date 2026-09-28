@@ -32,6 +32,12 @@ def main() -> None:
         help="Which model(s) to retrain (default: all)",
     )
     p_update.add_argument("--top", type=int, default=10, help="Top-N extra candidates in prediction")
+    p_update.add_argument("--top-main", type=int, default=10, help="Top-N main-number candidates in prediction")
+    p_update.add_argument(
+        "--both",
+        action="store_true",
+        help="Also predict main numbers, not just the extra number (passed through to predict)",
+    )
     p_update.add_argument(
         "--penalty", type=float, default=0.0, metavar="STRENGTH",
         help="Recency penalty passed through to predict (0 = disabled)",
@@ -52,9 +58,10 @@ def main() -> None:
         help="Override the guessed next-draw date passed through to predict.",
     )
 
-    p_train = sub.add_parser("train", help="Train extra-number models")
+    p_train = sub.add_parser("train", help="Train main-number and extra-number models")
     p_train.add_argument(
-        "--model", default="all", choices=["rf", "xgb", "lr", "all"]
+        "--model", required=True, choices=["rf", "xgb", "lr", "all"],
+        help="Which model to train. Use 'all' to train rf+xgb+lr (slow with ~1400 features).",
     )
     p_train.add_argument(
         "--full",
@@ -67,7 +74,7 @@ def main() -> None:
 
     p_wf = sub.add_parser(
         "walk-forward",
-        help="Honest backtest: retrain on [0..t-1] and predict draw t for the last N draws",
+        help="Honest backtest (extra number only): retrain on [0..t-1] and predict draw t for the last N draws",
     )
     p_wf.add_argument("--n-test", type=int, default=200, help="Trailing draws to backtest")
     p_wf.add_argument("--stride", type=int, default=20, help="Retrain every N draws")
@@ -76,9 +83,15 @@ def main() -> None:
     )
 
     p_pred = sub.add_parser(
-        "predict", help="Predict next draw's extra number"
+        "predict", help="Predict next draw's extra number (use --both to also predict main numbers)"
     )
     p_pred.add_argument("--top", type=int, default=10, help="Top-N extra candidates")
+    p_pred.add_argument("--top-main", type=int, default=10, help="Top-N main-number candidates (only used with --both)")
+    p_pred.add_argument(
+        "--both",
+        action="store_true",
+        help="Also predict main numbers, not just the extra number (default: extra number only)",
+    )
     p_pred.add_argument(
         "--model",
         default="xgb",
@@ -129,11 +142,12 @@ def main() -> None:
         from predictor import predict
         print("=== Step 1/3: Scraping latest draws ===")
         scrape()
-        print("\n=== Step 2/3: Retraining models on full history ===")
+        print("\n=== Step 2/3: Retraining extra + main models on full history ===")
         train(args.model, full=True)
         print("\n=== Step 3/3: Predicting next draw ===")
         predict(model_name="ensemble" if args.model == "all" else args.model,
-                top_extra=args.top, penalty=args.penalty, penalize_last=args.penalize_last,
+                top_extra=args.top, top_main=args.top_main, both=args.both,
+                penalty=args.penalty, penalize_last=args.penalize_last,
                 date=args.date)
 
     elif args.command == "scrape":
@@ -159,8 +173,9 @@ def main() -> None:
         )
     elif args.command == "predict":
         from predictor import predict
-        predict(model_name=args.model, top_extra=args.top, penalty=args.penalty,
-                penalize_last=args.penalize_last, wildcard=args.wildcard, date=args.date)
+        predict(model_name=args.model, top_extra=args.top, top_main=args.top_main, both=args.both,
+                penalty=args.penalty, penalize_last=args.penalize_last,
+                wildcard=args.wildcard, date=args.date)
 
 
 if __name__ == "__main__":

@@ -94,7 +94,6 @@ MAIN_MODEL_REGISTRY: dict[str, Callable] = {
                     LogisticRegression(
                         max_iter=2000,
                         solver="lbfgs",
-                        n_jobs=-1,
                         random_state=42,
                     ),
                 ),
@@ -260,6 +259,8 @@ def train(model_name: str = "all", full: bool = False) -> None:
 
     for name in names:
         train_extra_model(name, full=full)
+    for name in names:
+        train_main_model(name, full=full)
 
     X, _ = _load_features_extra()
     (MODELS_DIR / "feature_columns.json").write_text(json.dumps(list(X.columns)))

@@ -239,44 +239,46 @@ def _supporting_stats_main(raw: pd.DataFrame) -> dict[int, dict]:
     return stats
 
 
-def _check_model_staleness(model_name: str, raw: pd.DataFrame) -> None:
+def _check_model_staleness(model_name: str, raw: pd.DataFrame, both: bool = True) -> None:
     """Warn if saved models are stale or were trained with a held-out test split."""
     import json
     from models import MODELS_DIR, TEST_FRACTION
 
-    names = _available_models("extra") if model_name == "ensemble" else [model_name]
     latest_draw = raw["date"].iloc[-1]
     warned = False
 
-    for n in names:
-        path = EXTRA_MODEL_FILES.get(n)
-        if not (path and path.exists()):
-            continue
+    targets = (("extra", EXTRA_MODEL_FILES), ("main", MAIN_MODEL_FILES)) if both else (("extra", EXTRA_MODEL_FILES),)
+    for target, files in targets:
+        names = _available_models(target) if model_name == "ensemble" else [model_name]
+        for n in names:
+            path = files.get(n)
+            if not (path and path.exists()):
+                continue
 
-        # Check if trained with full data or a held-out split
-        metrics_path = MODELS_DIR / f"extra_{n}_metrics.json"
-        trained_full = False
-        if metrics_path.exists():
-            meta = json.loads(metrics_path.read_text())
-            trained_full = meta.get("trained_on") == "full"
+            # Check if trained with full data or a held-out split
+            metrics_path = MODELS_DIR / f"{target}_{n}_metrics.json"
+            trained_full = False
+            if metrics_path.exists():
+                meta = json.loads(metrics_path.read_text())
+                trained_full = meta.get("trained_on") == "full"
 
-        # Count draws that occurred after the model file was last written
-        trained_at = pd.Timestamp(path.stat().st_mtime, unit="s", tz="UTC").tz_localize(None)
-        draws_since = int((raw["date"] > trained_at).sum())
+            # Count draws that occurred after the model file was last written
+            trained_at = pd.Timestamp(path.stat().st_mtime, unit="s", tz="UTC").tz_localize(None)
+            draws_since = int((raw["date"] > trained_at).sum())
 
-        if not trained_full:
-            holdout = int(len(raw) * TEST_FRACTION)
-            print(
-                f"  WARNING [{n}]: trained with a {TEST_FRACTION:.0%} test split — "
-                f"the most recent ~{holdout} draws were held out and NOT used in training."
-            )
-            warned = True
-        elif draws_since > 0:
-            print(
-                f"  WARNING [{n}]: {draws_since} draw(s) since last retrain "
-                f"(latest draw: {latest_draw.date()}) are not in the training data."
-            )
-            warned = True
+            if not trained_full:
+                holdout = int(len(raw) * TEST_FRACTION)
+                print(
+                    f"  WARNING [{target}/{n}]: trained with a {TEST_FRACTION:.0%} test split — "
+                    f"the most recent ~{holdout} draws were held out and NOT used in training."
+                )
+                warned = True
+            elif draws_since > 0:
+                print(
+                    f"  WARNING [{target}/{n}]: {draws_since} draw(s) since last retrain "
+                    f"(latest draw: {latest_draw.date()}) are not in the training data."
+                )
+                warned = True
 
     if warned:
         print("  → Run `python main.py update` to scrape + retrain on all draws + predict.\n")
@@ -337,11 +339,12 @@ def _echo_scores_for_month(year: int, month: int) -> dict[int, float]:
     return scores
 
 
-def predict(model_name: str = "xgb", top_extra: int = 10, penalty: float = 0.0,
-            penalize_last: float | None = None, wildcard: bool = False,
-            date: str | None = None) -> None:
+def predict(model_name: str = "xgb", top_extra: int = 10, top_main: int = 10,
+            both: bool = False,
+            penalty: float = 0.0, penalize_last: float | None = None,
+            wildcard: bool = False, date: str | None = None) -> None:
     row, next_date, raw = _next_draw_feature_row(override_date=date)
-    _check_model_staleness(model_name, raw)
+    _check_model_staleness(model_name, raw, both=both)
     X_next = _align_features(row)
 
     extra_proba, extra_used = _get_extra_proba(model_name, X_next)
@@ -357,6 +360,13 @@ def predict(model_name: str = "xgb", top_extra: int = 10, penalty: float = 0.0,
 
     extra_stats = _supporting_stats_extra(raw)
 
+    if both:
+        main_proba, main_used = _get_main_proba(model_name, X_next)
+        main_order = np.argsort(-main_proba)[:top_main]
+        main_stats = _supporting_stats_main(raw)
+    else:
+        main_proba, main_used, main_order, main_stats = None, None, None, None
+
     wildcard_info = None
     if wildcard:
         target = next_date.normalize().replace(day=1) - pd.DateOffset(months=2)
@@ -370,14 +380,16 @@ def predict(model_name: str = "xgb", top_extra: int = 10, penalty: float = 0.0,
 
     en = _render_combined_report(
         extra_order, extra_proba, extra_stats,
-        next_date, raw, extra_used,
+        main_order, main_proba, main_stats,
+        next_date, raw, extra_used, main_used,
         lang="en", penalty=penalty,
         last_extra_penalized=last_extra_penalized, penalize_last_factor=penalize_last,
         wildcard_info=wildcard_info,
     )
     zh = _render_combined_report(
         extra_order, extra_proba, extra_stats,
-        next_date, raw, extra_used,
+        main_order, main_proba, main_stats,
+        next_date, raw, extra_used, main_used,
         lang="zh", penalty=penalty,
         last_extra_penalized=last_extra_penalized, penalize_last_factor=penalize_last,
         wildcard_info=wildcard_info,
@@ -401,9 +413,13 @@ def _render_combined_report(
     extra_order: np.ndarray,
     extra_proba: np.ndarray,
     extra_stats: dict[int, dict],
+    main_order: np.ndarray | None,
+    main_proba: np.ndarray | None,
+    main_stats: dict[int, dict] | None,
     next_date: pd.Timestamp,
     raw: pd.DataFrame,
     extra_used: str,
+    main_used: str | None,
     lang: str,
     penalty: float = 0.0,
     last_extra_penalized: list[tuple[int, float]] | None = None,
@@ -418,6 +434,7 @@ def _render_combined_report(
     sep = "=" * 60
     model_order = extra_order[:5] if wildcard_info is not None else extra_order
     total_conf = extra_proba.sum()
+    total_main_conf = main_proba.sum() if main_proba is not None else None
 
     def model_row(rank: int, idx) -> str:
         n = int(idx) + 1
@@ -428,11 +445,23 @@ def _render_combined_report(
             f"{conf_pct:<10.2f}{s['pct']:<10.2f}{s['gap']:<6}{s['recent30']}"
         )
 
+    def main_row(rank: int, idx) -> str:
+        n = int(idx) + 1
+        s = main_stats[n]
+        conf_pct = main_proba[idx] / total_main_conf * 100
+        return (
+            f"{rank:<5}{n:<6}{main_proba[idx]:<12.4f}"
+            f"{conf_pct:<10.2f}{s['pct']:<10.2f}{s['recent30']}"
+        )
+
     if lang == "en":
         w(sep)
         w(f"Mark Six Prediction — {next_date.date()}")
         w(f"History: {len(raw)} draws through {raw['date'].iloc[-1].date()}")
-        w(f"Model: {extra_used}")
+        model_line = f"Model: extra={extra_used}"
+        if main_used is not None:
+            model_line += f"  main={main_used}"
+        w(model_line)
         if penalty > 0.0:
             w(f"Recency penalty: {penalty} (discounts numbers drawn recently as extra)")
         if last_extra_penalized is not None:
@@ -448,6 +477,17 @@ def _render_combined_report(
         w()
         w(f"Uniform baseline: extra=1/49={1/49:.4f}")
         w("Lottery draws are independent random events.")
+        if main_order is not None:
+            w()
+            w(sep)
+            w(f"TOP {len(main_order)} SUGGESTED MAIN NUMBERS (model)")
+            w(f"{'Rank':<5}{'Num':<6}{'Confidence':<12}{'Conf%':<10}{'HistPct':<10}{'Last30'}")
+            w("-" * 55)
+            for rank, idx in enumerate(main_order, start=1):
+                w(main_row(rank, idx))
+            w()
+            w(f"Uniform baseline: main=6/49={6/49:.4f}")
+            w("Lottery draws are independent random events.")
         if wildcard_info is not None:
             w()
             w(sep)
@@ -473,7 +513,10 @@ def _render_combined_report(
         w(sep)
         w(f"马克六号预测 — {next_date.date()}")
         w(f"历史数据: {len(raw)} 期,截至 {raw['date'].iloc[-1].date()}")
-        w(f"模型: {extra_used}")
+        model_line = f"模型: 特别号={extra_used}"
+        if main_used is not None:
+            model_line += f"  正码={main_used}"
+        w(model_line)
         if penalty > 0.0:
             w(f"近期惩罚系数: {penalty}（对近期出现为特别号的号码降权）")
         if last_extra_penalized is not None:
@@ -489,6 +532,17 @@ def _render_combined_report(
         w()
         w(f"均匀基准: 特别号=1/49={1/49:.4f}")
         w("彩票开奖为独立随机事件,仅供参考。")
+        if main_order is not None:
+            w()
+            w(sep)
+            w(f"正码推荐前 {len(main_order)} 名（模型）")
+            w(f"{'排名':<5}{'号码':<6}{'置信度':<12}{'置信%':<10}{'历史占比':<10}{'近30期'}")
+            w("-" * 55)
+            for rank, idx in enumerate(main_order, start=1):
+                w(main_row(rank, idx))
+            w()
+            w(f"均匀基准: 正码=6/49={6/49:.4f}")
+            w("彩票开奖为独立随机事件,仅供参考。")
         if wildcard_info is not None:
             w()
             w(sep)
