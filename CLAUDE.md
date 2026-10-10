@@ -71,3 +71,12 @@ predictor.py → ranked candidates with confidence scores, for both targets
 - This project is for education purpose to learn statistics, based on the idea of the lottery result is not uniformly distributed and predictable.
 - Do not add the signature by 'Claude' in the commit message
 - When explaining, use simple language, avoid using jargon to explain jargons.
+- Development proceeds through the pipeline one stage at a time (scrape → preprocess →
+  train → predict) — verify each stage's output before moving to the next, rather than
+  changing multiple stages at once.
+
+## Status
+
+See `STATUS.md` for current deployment status, known blockers, and next steps. That file
+changes often (dev notes); this file (`CLAUDE.md`) stays limited to stable architecture and
+instructions.
