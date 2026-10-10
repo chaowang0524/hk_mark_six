@@ -27,7 +27,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 import xgboost as xgb
 
-from preprocessing import FEATURES_PATH, POOL, RAW_PATH, build_features
+from preprocessing import FEATURES_PATH, POOL, RAW_PATH, preprocess
 
 MODELS_DIR = Path("data/models")
 TEST_FRACTION = 0.05
@@ -119,10 +119,10 @@ def _check_schema(df: pd.DataFrame) -> None:
 def _maybe_rebuild_features() -> None:
     if not FEATURES_PATH.exists():
         print("features.csv not found; building from raw data...")
-        build_features()
+        preprocess()
     elif RAW_PATH.exists() and RAW_PATH.stat().st_mtime > FEATURES_PATH.stat().st_mtime:
         print("raw_draws.csv is newer than features.csv; rebuilding features...")
-        build_features()
+        preprocess()
 
 
 def _load_features_extra() -> tuple[pd.DataFrame, pd.Series]:
@@ -253,13 +253,24 @@ def train_main_model(name: str, full: bool = False) -> None:
     print(f"  hit-rate@6={hit6:.4f}  (uniform baseline={6*6/49:.4f})")
 
 
-def train(model_name: str = "all", full: bool = False) -> None:
+def train(
+    model_name: str = "all",
+    full: bool = False,
+    on_step: Callable[[str, str], None] | None = None,
+) -> None:
+    """on_step(target, name), called right before each sub-model trains —
+    e.g. on_step("extra", "xgb") — so a caller (e.g. the web UI) can show
+    live progress through a potentially long run."""
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
     names = list(EXTRA_MODEL_REGISTRY.keys()) if model_name == "all" else [model_name]
 
     for name in names:
+        if on_step:
+            on_step("extra", name)
         train_extra_model(name, full=full)
     for name in names:
+        if on_step:
+            on_step("main", name)
         train_main_model(name, full=full)
 
     X, _ = _load_features_extra()

@@ -66,14 +66,40 @@ Server setup:
 - Deployed: commit `c705bb4`, pulled on the server, service restarted (`active`), site
   returns 200. Not yet click-tested live in a browser — only curl/systemctl checked.
 
+**Train page + features-rebuild bugfix — shipped (2026-10-10):**
+- New "🏋️ Train" page in `app.py`, between Preprocess and Data. Pick a model (Random
+  Forest / XGBoost / Logistic Regression / All three) and whether to train on all data
+  with no held-out accuracy check (`--full`), then click "Start training". Progress
+  shows live via `st.status()` — a line like "(2/6) Training main numbers model:
+  XGBoost…" updates per sub-model — ending in "✅ Training done" with the captured
+  console output, or an error.
+- `models.train()` gained an optional `on_step(target, name)` callback (default `None`,
+  so the CLI's behavior is unchanged) so the page gets that live progress without
+  duplicating the training loop.
+- Found and fixed a real bug while building this: `models._maybe_rebuild_features()`
+  called `preprocessing.build_features()`, which only returns a DataFrame in memory and
+  never writes it to disk — so every "rebuilding features..." message was a no-op, and
+  training silently kept reading the **stale** `features.csv` from disk. Because the
+  on-disk file's mtime never advanced, this repeated (and re-discarded the rebuild) on
+  every one of the up to 7 internal feature-loads inside a single `train()` run. Swapped
+  in `preprocessing.preprocess()`, which actually persists — rebuild now happens once
+  per run, and training actually picks up new draws. Verified directly: one "rebuilding
+  features..." + "Preprocess complete" message per `train()` call, not 3–7.
+- Verified locally end-to-end with Streamlit's `AppTest` harness (no real browser tool
+  available in that session): navigated to the Train page, picked the `lr` model,
+  clicked "Start training", confirmed it completes and reports success. Not yet
+  click-tested in an actual browser, locally or on the server.
+
 **Next steps when picking this back up:**
 1. Click through the live "⚙️ Preprocess" button once in a browser to confirm it works
    end-to-end against the real `raw_draws.csv` on the server (only curl/systemctl checked
    so far).
-2. Rebuild the train and predict stages as their own pages/buttons, same incremental
-   approach (one pipeline stage at a time).
-3. Optional/future: revisit the scraper (GFW block on the server, undiagnosed issue locally)
+2. Click through the new "🏋️ Train" page in a real browser (local or server) — only
+   Streamlit's `AppTest` harness was used so far, not an actual click.
+3. Rebuild Predict as its own page, same incremental approach (one pipeline stage at a
+   time) — Preprocess and Train are now both live; Predict is the last one.
+4. Optional/future: revisit the scraper (GFW block on the server, undiagnosed issue locally)
    if automatic updates become worth the effort again.
-4. Minor housekeeping, not urgent: commit `6f35c97` accidentally bundled in an unrelated
+5. Minor housekeeping, not urgent: commit `6f35c97` accidentally bundled in an unrelated
    change to `十次试验.txt` (a personal notes file) alongside the Data-page feature — content
    is intact, just filed under the wrong commit message. No action taken; flagged to the user.

@@ -1,10 +1,12 @@
 """Web front end for the Mark Six pipeline — no install, no command line.
 
 Deployed on a dedicated VPS, this lets anyone with the link click a button
-to work the pipeline in their browser. Two pages, switched with the buttons
-at the top:
+to work the pipeline in their browser. Pages, switched with the buttons at
+the top:
 
 - "Preprocess": rebuilds data/features.csv from the current raw draws.
+- "Train": trains the extra-number and main-number models from the current
+  features.csv.
 - "Data": password-protected. Shows the most recent draws and lets you add
   or remove one by hand — scraping is blocked from this server's network
   and from the local dev machine (see STATUS.md), so this is the only way
@@ -29,7 +31,7 @@ st.set_page_config(page_title="Mark Six Predictor", page_icon="🎱")
 if "page" not in st.session_state:
     st.session_state.page = "preprocess"
 
-nav_col1, nav_col2 = st.columns(2)
+nav_col1, nav_col2, nav_col3 = st.columns(3)
 with nav_col1:
     if st.button(
         "⚙️ Preprocess",
@@ -38,6 +40,13 @@ with nav_col1:
     ):
         st.session_state.page = "preprocess"
 with nav_col2:
+    if st.button(
+        "🏋️ Train",
+        width="stretch",
+        type="primary" if st.session_state.page == "train" else "secondary",
+    ):
+        st.session_state.page = "train"
+with nav_col3:
     if st.button(
         "📋 Data",
         width="stretch",
@@ -81,6 +90,78 @@ def render_preprocess_page() -> None:
     elif output:
         st.success("✅ Preprocess done")
         st.code(output, language=None)
+
+
+_MODEL_LABELS = {
+    "rf": "Random Forest",
+    "xgb": "XGBoost",
+    "lr": "Logistic Regression",
+    "all": "All three",
+}
+_TARGET_LABELS = {"extra": "extra number", "main": "main numbers"}
+
+
+def render_train_page() -> None:
+    st.title("🏋️ Train Models")
+    st.caption(
+        "Trains the extra-number and main-number models from the current "
+        "data/features.csv. Run Preprocess first if the data has changed."
+    )
+
+    model_choice = st.radio(
+        "Which model(s) to train?",
+        options=["rf", "xgb", "lr", "all"],
+        format_func=lambda m: _MODEL_LABELS[m],
+        index=3,
+        horizontal=True,
+    )
+
+    full = st.checkbox(
+        "Use all data, no accuracy check",
+        help="Normally some of the most recent draws are held back so we can "
+        "check how accurate the model is. Turn this on to train on every "
+        "draw instead — do this once you're happy with the accuracy, right "
+        "before predicting.",
+    )
+
+    run_clicked = st.button("🏋️ Start training", type="primary")
+
+    if run_clicked:
+        from models import train, EXTRA_MODEL_REGISTRY
+
+        names = (
+            list(EXTRA_MODEL_REGISTRY.keys()) if model_choice == "all" else [model_choice]
+        )
+        total_steps = len(names) * 2
+        progress = {"done": 0}
+
+        output: str | None = None
+        error: str | None = None
+
+        with st.status("Starting…", expanded=True) as status:
+
+            def on_step(target: str, name: str) -> None:
+                progress["done"] += 1
+                status.update(
+                    label=f"({progress['done']}/{total_steps}) Training "
+                    f"{_TARGET_LABELS[target]} model: {_MODEL_LABELS[name]}…"
+                )
+
+            buf = io.StringIO()
+            try:
+                with contextlib.redirect_stdout(buf):
+                    train(model_choice, full=full, on_step=on_step)
+                output = buf.getvalue()
+                status.update(label="Training complete", state="complete")
+            except Exception as exc:  # noqa: BLE001 — surface any pipeline failure to the page
+                error = str(exc)
+                status.update(label="Training failed", state="error")
+
+        if error:
+            st.error(f"Something went wrong: {error}")
+        elif output:
+            st.success("✅ Training done")
+            st.code(output, language=None)
 
 
 def _check_password(entered: str) -> bool:
@@ -172,5 +253,7 @@ def render_data_page() -> None:
 
 if st.session_state.page == "data":
     render_data_page()
+elif st.session_state.page == "train":
+    render_train_page()
 else:
     render_preprocess_page()
