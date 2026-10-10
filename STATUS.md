@@ -29,19 +29,34 @@ Server setup:
   xgb --full` took ~20 min on this box's 2 cores (vs. ~5 min locally) — don't assume local
   timings apply there.
 
-**Known blocker — scraping is broken, decision deferred:**
+**Scraper is still broken — worked around, not fixed:**
 - The scraper's data source (`pilio.idv.tw`, a Taiwan domain) gets its TLS connection
   actively reset from the `marksix` server — the Great Firewall blocking it, not a config
   issue. Separately, scraping isn't currently working from the local Mac either (unrelated
-  reason, not yet diagnosed).
-- Decision (explicit from user): don't fix this now — ship with the current static data
-  snapshot, revisit later. Likely direction floated by the user: a manual raw-results input
-  feature instead of relying on the scraper, but this is not designed or built yet.
-- Consequence: `app.py`'s "🔄 Refresh data & retrain" button calls `scrape()` and will error
-  out if clicked, since scraping doesn't work anywhere right now. Not yet resolved whether to
-  disable/hide that button in the meantime — asked the user, no answer yet.
+  reason, not diagnosed). `src/scraper.py` itself was not touched/fixed.
+- Decision (explicit from user): don't fix the scraper now — build manual data entry instead.
+
+**Manual data entry — shipped and live (2026-10-10):**
+- New "📋 Data" page in `app.py`, password-gated (`st.text_input` + `st.secrets`).
+  Password is `9527` (placeholder — change it before giving the link to anyone you don't
+  fully trust), read from `.streamlit/secrets.toml`, gitignored, present both locally and
+  on the server at `~/lottery/.streamlit/secrets.toml` (`chmod 600`).
+- Shows the last 10 draws, a form to add a new one (validated: 6 distinct numbers 1–49,
+  extra ≠ any main, date after the last draw; draw ID like `26/109` auto-assigned), and a
+  two-step confirm to delete the most recent entry (undo for mis-entry).
+- Logic lives in `src/data_entry.py` (`read_tail`/`add_draw`/`delete_last`), reusing
+  `scraper.py`'s `Draw`/ID-assignment code so hand-entered rows are indistinguishable in
+  format from scraped ones. Covered by `tests/test_data_entry.py` (10 tests).
+- The "🔁 Retrain from current data" button (renamed from "🔄 Refresh data & retrain") no
+  longer calls `scrape()` — it just rebuilds features and retrains from whatever is
+  currently in `raw_draws.csv`. Resolves the previously-open "disable the button?" question.
+- Deployed: pushed as commits `7e29e2a`/`6f35c97`, pulled on the server, service restarted,
+  health check and manual click-through both confirmed working.
 
 **Next steps when picking this back up:**
-1. Decide on the manual-input (or alternative) fix for data refresh.
-2. Decide what `app.py` should do about the currently-broken retrain button.
-3. Nothing else is blocking — hosting, service management, and firewall are done and stable.
+1. Nothing blocking — manual entry is now the live data-acquisition path going forward.
+2. Optional/future: revisit the scraper (GFW block on the server, undiagnosed issue locally)
+   if automatic updates become worth the effort again.
+3. Minor housekeeping, not urgent: commit `6f35c97` accidentally bundled in an unrelated
+   change to `十次试验.txt` (a personal notes file) alongside the Data-page feature — content
+   is intact, just filed under the wrong commit message. No action taken; flagged to the user.
