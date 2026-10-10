@@ -99,12 +99,22 @@ _MODEL_LABELS = {
     "all": "All three",
 }
 _TARGET_LABELS = {"extra": "extra number", "main": "main numbers"}
+_TARGET_CHOICE_LABELS = {
+    "both": "Both (recommended)",
+    "extra": "Extra number only",
+    "main": "Main numbers only",
+}
+_TARGET_CHOICE_TARGETS = {
+    "both": ("extra", "main"),
+    "extra": ("extra",),
+    "main": ("main",),
+}
 
 
 def render_train_page() -> None:
     st.title("🏋️ Train Models")
     st.caption(
-        "Trains the extra-number and main-number models from the current "
+        "Trains the extra-number and/or main-number models from the current "
         "data/features.csv. Run Preprocess first if the data has changed."
     )
 
@@ -113,6 +123,14 @@ def render_train_page() -> None:
         options=["rf", "xgb", "lr", "all"],
         format_func=lambda m: _MODEL_LABELS[m],
         index=3,
+        horizontal=True,
+    )
+
+    target_choice = st.radio(
+        "Train which target?",
+        options=["both", "extra", "main"],
+        format_func=lambda t: _TARGET_CHOICE_LABELS[t],
+        index=0,
         horizontal=True,
     )
 
@@ -132,7 +150,8 @@ def render_train_page() -> None:
         names = (
             list(EXTRA_MODEL_REGISTRY.keys()) if model_choice == "all" else [model_choice]
         )
-        total_steps = len(names) * 2
+        targets = _TARGET_CHOICE_TARGETS[target_choice]
+        total_steps = len(names) * len(targets)
         progress = {"done": 0}
 
         output: str | None = None
@@ -150,7 +169,7 @@ def render_train_page() -> None:
             buf = io.StringIO()
             try:
                 with contextlib.redirect_stdout(buf):
-                    train(model_choice, full=full, on_step=on_step)
+                    train(model_choice, full=full, targets=targets, on_step=on_step)
                 output = buf.getvalue()
                 status.update(label="Training complete", state="complete")
             except Exception as exc:  # noqa: BLE001 — surface any pipeline failure to the page

@@ -256,22 +256,27 @@ def train_main_model(name: str, full: bool = False) -> None:
 def train(
     model_name: str = "all",
     full: bool = False,
+    targets: tuple[str, ...] = ("extra", "main"),
     on_step: Callable[[str, str], None] | None = None,
 ) -> None:
-    """on_step(target, name), called right before each sub-model trains —
+    """targets: which of "extra"/"main" to train — defaults to both.
+
+    on_step(target, name), called right before each sub-model trains —
     e.g. on_step("extra", "xgb") — so a caller (e.g. the web UI) can show
     live progress through a potentially long run."""
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
     names = list(EXTRA_MODEL_REGISTRY.keys()) if model_name == "all" else [model_name]
 
-    for name in names:
-        if on_step:
-            on_step("extra", name)
-        train_extra_model(name, full=full)
-    for name in names:
-        if on_step:
-            on_step("main", name)
-        train_main_model(name, full=full)
+    if "extra" in targets:
+        for name in names:
+            if on_step:
+                on_step("extra", name)
+            train_extra_model(name, full=full)
+    if "main" in targets:
+        for name in names:
+            if on_step:
+                on_step("main", name)
+            train_main_model(name, full=full)
 
     X, _ = _load_features_extra()
     (MODELS_DIR / "feature_columns.json").write_text(json.dumps(list(X.columns)))

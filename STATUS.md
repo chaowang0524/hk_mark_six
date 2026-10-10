@@ -89,6 +89,12 @@ Server setup:
   available in that session): navigated to the Train page, picked the `lr` model,
   clicked "Start training", confirmed it completes and reports success. Not yet
   click-tested in an actual browser, locally or on the server.
+- Follow-up: added a "Train which target?" choice (Both / Extra number only / Main
+  numbers only) so you don't have to retrain both targets every time — useful since
+  the two targets are independent models and don't need to move together.
+  `models.train()` gained a matching `targets` parameter (default `("extra", "main")`,
+  CLI unaffected). Verified with `AppTest` again: `lr` + "Extra number only" trains
+  `[extra/lr]` and skips `[main/lr]`.
 
 **Next steps when picking this back up:**
 1. Click through the live "⚙️ Preprocess" button once in a browser to confirm it works
