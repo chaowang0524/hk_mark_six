@@ -1,12 +1,15 @@
 """Web front end for the Mark Six pipeline — no install, no command line.
 
-Deployed on Streamlit Community Cloud, this lets anyone with the link click
-a button and get a prediction in their browser. Two modes:
+Deployed on a dedicated VPS, this lets anyone with the link click a button
+and get a prediction in their browser. Two pages, switched with the buttons
+at the top:
 
-- "Show prediction": reuses whatever model is already trained on this
-  server (fast, seconds).
-- "Refresh data & retrain": re-scrapes the latest draws and retrains from
-  scratch (slow — several minutes — but keeps predictions current).
+- "Predict": shows a prediction from whatever model is already trained on
+  this server, or retrains from the current data snapshot.
+- "Data": password-protected. Shows the most recent draws and lets you add
+  or remove one by hand — scraping is blocked from this server's network
+  and from the local dev machine (see STATUS.md), so this is the only way
+  new draws get into the dataset for now.
 """
 
 from __future__ import annotations
@@ -25,24 +28,37 @@ sys.path.insert(0, str(SRC))
 MODELS_DIR = ROOT / "data" / "models"
 
 st.set_page_config(page_title="Mark Six Predictor", page_icon="🎱")
-st.title("🎱 Mark Six Extra-Number Prediction")
-st.caption(
-    "Statistical/ML prediction for the next Hong Kong Mark Six extra number. "
-    "Educational project — draws are independent, this is not a guarantee."
-)
+
+if "page" not in st.session_state:
+    st.session_state.page = "predict"
+
+nav_col1, nav_col2 = st.columns(2)
+with nav_col1:
+    if st.button(
+        "🔮 Predict",
+        width="stretch",
+        type="primary" if st.session_state.page == "predict" else "secondary",
+    ):
+        st.session_state.page = "predict"
+with nav_col2:
+    if st.button(
+        "📋 Data",
+        width="stretch",
+        type="primary" if st.session_state.page == "data" else "secondary",
+    ):
+        st.session_state.page = "data"
+
+st.divider()
 
 
 def _run(both: bool, retrain: bool) -> str:
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         if retrain:
-            from scraper import scrape
             from preprocessing import preprocess
             from models import train
 
-            print("=== Fetching latest draws ===")
-            scrape()
-            print("\n=== Building features ===")
+            print("=== Building features from current data ===")
             preprocess()
             print("\n=== Training model on full history (the slow part) ===")
             train("xgb", full=True)
@@ -53,56 +69,156 @@ def _run(both: bool, retrain: bool) -> str:
     return buf.getvalue()
 
 
-has_model = (MODELS_DIR / "extra_xgb.joblib").exists()
-
-both = st.checkbox(
-    "Also predict the 6 main numbers (slower to retrain)",
-    value=False,
-    help="The project currently focuses on the extra number; main-number "
-    "prediction is available but roughly doubles retrain time.",
-)
-
-col1, col2 = st.columns(2)
-with col1:
-    quick_clicked = st.button(
-        "🔮 Show prediction",
-        disabled=not has_model,
-        help="Uses the model already trained on this server.",
-    )
-with col2:
-    retrain_clicked = st.button(
-        "🔄 Refresh data & retrain",
-        help="Re-scrapes the latest draws and retrains from scratch. "
-        "Takes several minutes — please be patient and don't close the tab.",
+def render_predict_page() -> None:
+    st.title("🎱 Mark Six Extra-Number Prediction")
+    st.caption(
+        "Statistical/ML prediction for the next Hong Kong Mark Six extra number. "
+        "Educational project — draws are independent, this is not a guarantee."
     )
 
-if not has_model and not retrain_clicked:
-    st.info(
-        "No trained model on this server yet. Click **Refresh data & retrain** "
-        "to build one — only needed once, then it's saved for next time. "
-        "This takes several minutes, please wait."
+    has_model = (MODELS_DIR / "extra_xgb.joblib").exists()
+
+    both = st.checkbox(
+        "Also predict the 6 main numbers (slower to retrain)",
+        value=False,
+        help="The project currently focuses on the extra number; main-number "
+        "prediction is available but roughly doubles retrain time.",
     )
 
-output: str | None = None
-error: str | None = None
+    col1, col2 = st.columns(2)
+    with col1:
+        quick_clicked = st.button(
+            "🔮 Show prediction",
+            disabled=not has_model,
+            help="Uses the model already trained on this server.",
+        )
+    with col2:
+        retrain_clicked = st.button(
+            "🔁 Retrain from current data",
+            help="Rebuilds features and retrains from the current data snapshot. "
+            "Add new draws on the Data page first if there are any. Takes a "
+            "few minutes — please be patient and don't close the tab.",
+        )
 
-if retrain_clicked:
-    with st.spinner(
-        "Scraping latest draws and retraining — this can take 5+ minutes. "
-        "Please keep this tab open."
-    ):
+    if not has_model and not retrain_clicked:
+        st.info(
+            "No trained model on this server yet. Click **Retrain from current "
+            "data** to build one — only needed once, then it's saved for next "
+            "time. This takes a few minutes, please wait."
+        )
+
+    output: str | None = None
+    error: str | None = None
+
+    if retrain_clicked:
+        with st.spinner(
+            "Retraining — this can take a few minutes. Please keep this tab open."
+        ):
+            try:
+                output = _run(both=both, retrain=True)
+            except Exception as exc:  # noqa: BLE001 — surface any pipeline failure to the page
+                error = str(exc)
+    elif quick_clicked:
+        with st.spinner("Predicting…"):
+            try:
+                output = _run(both=both, retrain=False)
+            except Exception as exc:  # noqa: BLE001
+                error = str(exc)
+
+    if error:
+        st.error(f"Something went wrong: {error}")
+    if output:
+        st.code(output, language=None)
+
+
+def _check_password(entered: str) -> bool:
+    try:
+        correct = st.secrets["data_password"]
+    except (KeyError, FileNotFoundError):
+        st.error(
+            "No `data_password` configured on this server "
+            "(expected in `.streamlit/secrets.toml`)."
+        )
+        return False
+    return entered == correct
+
+
+def render_data_page() -> None:
+    st.title("📋 Manage Draw Data")
+
+    # st.rerun() below fires right after setting these, so the message has
+    # to survive into the *next* run instead of being shown before the rerun.
+    if "flash_success" in st.session_state:
+        st.success(st.session_state.pop("flash_success"))
+    if "flash_info" in st.session_state:
+        st.info(st.session_state.pop("flash_info"))
+
+    if not st.session_state.get("data_unlocked", False):
+        st.caption(
+            "Password-protected — this edits the live dataset used for predictions."
+        )
+        password = st.text_input("Password", type="password")
+        if st.button("Unlock"):
+            if _check_password(password):
+                st.session_state.data_unlocked = True
+                st.rerun()
+            else:
+                st.error("Wrong password.")
+        return
+
+    from data_entry import add_draw, delete_last, read_tail
+
+    st.caption(
+        "Scraping is currently blocked (see STATUS.md), so new draws are "
+        "added here by hand."
+    )
+
+    st.subheader("Most recent draws")
+    st.dataframe(read_tail(10), width="stretch", hide_index=True)
+
+    st.subheader("Add a new draw")
+    with st.form("add_draw_form", clear_on_submit=True):
+        date = st.date_input("Draw date")
+        mains = st.multiselect(
+            "6 main numbers", options=list(range(1, 50)), max_selections=6
+        )
+        extra = st.number_input("Extra number", min_value=1, max_value=49, value=1, step=1)
+        submitted = st.form_submit_button("Add draw")
+
+    if submitted:
         try:
-            output = _run(both=both, retrain=True)
-        except Exception as exc:  # noqa: BLE001 — surface any pipeline failure to the page
-            error = str(exc)
-elif quick_clicked:
-    with st.spinner("Predicting…"):
-        try:
-            output = _run(both=both, retrain=False)
-        except Exception as exc:  # noqa: BLE001
-            error = str(exc)
+            draw_id = add_draw(date.isoformat(), mains, int(extra))
+            st.session_state.flash_success = f"Added draw {draw_id}."
+            st.rerun()
+        except ValueError as exc:
+            st.error(str(exc))
 
-if error:
-    st.error(f"Something went wrong: {error}")
-if output:
-    st.code(output, language=None)
+    st.subheader("Undo")
+    if st.session_state.get("confirm_delete", False):
+        st.warning("Delete the most recent draw shown above? This can't be undone.")
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("✅ Yes, delete it"):
+                removed = delete_last()
+                st.session_state.confirm_delete = False
+                if removed:
+                    st.session_state.flash_success = (
+                        f"Deleted draw {removed['draw']} ({removed['date']})."
+                    )
+                else:
+                    st.session_state.flash_info = "Nothing to delete."
+                st.rerun()
+        with c2:
+            if st.button("Cancel"):
+                st.session_state.confirm_delete = False
+                st.rerun()
+    else:
+        if st.button("🗑️ Delete most recent entry"):
+            st.session_state.confirm_delete = True
+            st.rerun()
+
+
+if st.session_state.page == "data":
+    render_data_page()
+else:
+    render_predict_page()

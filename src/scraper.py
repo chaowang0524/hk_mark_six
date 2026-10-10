@@ -94,7 +94,7 @@ def _parse_page(html: str) -> list[Draw]:
     return draws
 
 
-def _load_existing() -> tuple[set[str], dict[str, int]]:
+def load_existing_draws() -> tuple[set[str], dict[str, int]]:
     """Returns (known draw dates, highest sequence number seen per 2-digit year)."""
     existing_dates: set[str] = set()
     last_num_by_year: dict[str, int] = {}
@@ -130,7 +130,7 @@ def _find_resume_page(
     return max(result - 1, 1)
 
 
-def _assign_ids_and_write(
+def assign_ids_and_write(
     draws: list[Draw], last_num_by_year: dict[str, int]
 ) -> int:
     if not draws:
@@ -161,7 +161,7 @@ def _assign_ids_and_write(
 
 def scrape(delay: float = 0.4, incremental: bool = True) -> int:
     """Scrape historical draws. Returns number of new rows appended."""
-    existing_dates, last_num_by_year = _load_existing() if incremental else (set(), {})
+    existing_dates, last_num_by_year = load_existing_draws() if incremental else (set(), {})
     session = requests.Session()
     session.headers.update({"User-Agent": USER_AGENT})
 
@@ -187,7 +187,7 @@ def scrape(delay: float = 0.4, incremental: bool = True) -> int:
             time.sleep(delay)
 
     collected.sort(key=lambda d: d.date)
-    written = _assign_ids_and_write(collected, last_num_by_year)
+    written = assign_ids_and_write(collected, last_num_by_year)
     print(f"Scrape complete: wrote {written} new rows to {DATA_PATH}")
     return written
 

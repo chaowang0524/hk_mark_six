@@ -15,5 +15,8 @@ data/reports/
 # OS
 .DS_Store
 
+# Secrets
+.streamlit/secrets.toml
+
 # Coding agent
 CLAUDE.md
