@@ -53,10 +53,27 @@ Server setup:
 - Deployed: pushed as commits `7e29e2a`/`6f35c97`, pulled on the server, service restarted,
   health check and manual click-through both confirmed working.
 
+**Preprocess page — shipped and live (2026-10-10):**
+- Rebuilding the frontend one pipeline stage at a time (per `CLAUDE.md`). The old "🔮
+  Predict" page (with its "Show prediction" / "Retrain from current data" buttons, which
+  bundled preprocess+train+predict together) is gone for now.
+- New "⚙️ Preprocess" page in `app.py`: single button that runs `preprocessing.preprocess()`
+  behind a spinner ("Preprocessing…"), then shows "✅ Preprocess done" plus the captured
+  console output, or an error.
+- Nav is now just "⚙️ Preprocess" / "📋 Data" — no standalone predict/train UI exists on the
+  frontend right now; that comes back once the train and predict stages are rebuilt the
+  same way.
+- Deployed: commit `c705bb4`, pulled on the server, service restarted (`active`), site
+  returns 200. Not yet click-tested live in a browser — only curl/systemctl checked.
+
 **Next steps when picking this back up:**
-1. Nothing blocking — manual entry is now the live data-acquisition path going forward.
-2. Optional/future: revisit the scraper (GFW block on the server, undiagnosed issue locally)
+1. Click through the live "⚙️ Preprocess" button once in a browser to confirm it works
+   end-to-end against the real `raw_draws.csv` on the server (only curl/systemctl checked
+   so far).
+2. Rebuild the train and predict stages as their own pages/buttons, same incremental
+   approach (one pipeline stage at a time).
+3. Optional/future: revisit the scraper (GFW block on the server, undiagnosed issue locally)
    if automatic updates become worth the effort again.
-3. Minor housekeeping, not urgent: commit `6f35c97` accidentally bundled in an unrelated
+4. Minor housekeeping, not urgent: commit `6f35c97` accidentally bundled in an unrelated
    change to `十次试验.txt` (a personal notes file) alongside the Data-page feature — content
    is intact, just filed under the wrong commit message. No action taken; flagged to the user.
