@@ -99,6 +99,21 @@ def _next_draw_feature_row(override_date: str | None = None) -> tuple[pd.Series,
     return features.iloc[-1], next_date, raw
 
 
+def list_available_models(both: bool = True) -> list[str]:
+    """Model names with enough trained files on disk to run `predict`.
+
+    Individual model names come first, sorted; "ensemble" is appended when
+    2+ of them qualify. Used to drive a model-choice UI: skip the choice
+    entirely when this returns a single name.
+    """
+    extra_avail = set(_available_models("extra"))
+    avail = extra_avail & set(_available_models("main")) if both else extra_avail
+    names = sorted(avail)
+    if len(names) > 1:
+        names.append("ensemble")
+    return names
+
+
 def _align_features(row: pd.Series) -> pd.DataFrame:
     cols_path = MODELS_DIR / "feature_columns.json"
     if not cols_path.exists():

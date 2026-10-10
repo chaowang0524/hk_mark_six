@@ -96,16 +96,33 @@ Server setup:
   CLI unaffected). Verified with `AppTest` again: `lr` + "Extra number only" trains
   `[extra/lr]` and skips `[main/lr]`.
 
+**Predict page — shipped (2026-10-10):**
+- New "🔮 Predict" page in `app.py`, between Train and Data — the last pipeline stage to
+  come back to the frontend. Scans `data/models/` for which model(s) have both an
+  `extra_*.joblib` and `main_*.joblib` present; with only one, it's used silently
+  (captioned, no choice shown), with 2+ a radio lets you pick (including an "Ensemble"
+  option once 2+ individual models qualify). Also offers: overriding the predicted draw
+  date (default: auto-guessed next Tue/Thu/Sat, matching the CLI's `--date`), and a
+  checkbox to penalize the last 3 extra numbers (matching the CLI's `--penalize-last`,
+  same default factor 0.5). Click "🔮 Run prediction" to get the full report (both
+  targets) as captured console output, same style as Preprocess/Train.
+- `predictor.py` gained `list_available_models(both=True)`, a small public helper around
+  the existing private `_available_models()` so the UI can drive its model-choice control
+  without duplicating the file-existence logic.
+- Verified locally end-to-end with Streamlit's `AppTest` harness: with only `lr` trained,
+  confirmed no radio is shown and prediction runs clean; temporarily added fake `*_rf`
+  model files to confirm the radio appears with Ensemble as a third option, then removed
+  them. Also verified the date-override and penalize-last checkboxes both take effect
+  (overridden date and the "Last-draw penalty" line both showed up correctly in the
+  output). Not yet click-tested in an actual browser, locally or on the server.
+
 **Next steps when picking this back up:**
-1. Click through the live "⚙️ Preprocess" button once in a browser to confirm it works
-   end-to-end against the real `raw_draws.csv` on the server (only curl/systemctl checked
-   so far).
-2. Click through the new "🏋️ Train" page in a real browser (local or server) — only
-   Streamlit's `AppTest` harness was used so far, not an actual click.
-3. Rebuild Predict as its own page, same incremental approach (one pipeline stage at a
-   time) — Preprocess and Train are now both live; Predict is the last one.
-4. Optional/future: revisit the scraper (GFW block on the server, undiagnosed issue locally)
+1. Click through all three pipeline pages ("⚙️ Preprocess", "🏋️ Train", "🔮 Predict") once
+   in a real browser (local or server) — only Streamlit's `AppTest` harness has been used
+   so far, not an actual click. This closes out the "rebuild the frontend one stage at a
+   time" effort now that all three stages exist.
+2. Optional/future: revisit the scraper (GFW block on the server, undiagnosed issue locally)
    if automatic updates become worth the effort again.
-5. Minor housekeeping, not urgent: commit `6f35c97` accidentally bundled in an unrelated
+3. Minor housekeeping, not urgent: commit `6f35c97` accidentally bundled in an unrelated
    change to `十次试验.txt` (a personal notes file) alongside the Data-page feature — content
    is intact, just filed under the wrong commit message. No action taken; flagged to the user.

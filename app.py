@@ -7,6 +7,8 @@ the top:
 - "Preprocess": rebuilds data/features.csv from the current raw draws.
 - "Train": trains the extra-number and main-number models from the current
   features.csv.
+- "Predict": picks a trained model (if more than one is available) and
+  predicts the next draw's extra number and 6 main numbers.
 - "Data": password-protected. Shows the most recent draws and lets you add
   or remove one by hand — scraping is blocked from this server's network
   and from the local dev machine (see STATUS.md), so this is the only way
@@ -31,7 +33,7 @@ st.set_page_config(page_title="Mark Six Predictor", page_icon="🎱")
 if "page" not in st.session_state:
     st.session_state.page = "preprocess"
 
-nav_col1, nav_col2, nav_col3 = st.columns(3)
+nav_col1, nav_col2, nav_col3, nav_col4 = st.columns(4)
 with nav_col1:
     if st.button(
         "⚙️ Preprocess",
@@ -47,6 +49,13 @@ with nav_col2:
     ):
         st.session_state.page = "train"
 with nav_col3:
+    if st.button(
+        "🔮 Predict",
+        width="stretch",
+        type="primary" if st.session_state.page == "predict" else "secondary",
+    ):
+        st.session_state.page = "predict"
+with nav_col4:
     if st.button(
         "📋 Data",
         width="stretch",
@@ -183,6 +192,90 @@ def render_train_page() -> None:
             st.code(output, language=None)
 
 
+_PREDICT_MODEL_LABELS = {
+    "rf": "Random Forest",
+    "xgb": "XGBoost",
+    "lr": "Logistic Regression",
+    "ensemble": "Ensemble (average of all trained)",
+}
+
+
+def render_predict_page() -> None:
+    st.title("🔮 Predict Next Draw")
+    st.caption(
+        "Predicts the extra number and the 6 main numbers for the next draw "
+        "from the currently trained models. Run Train first if you haven't, "
+        "or if the data has changed since the last training."
+    )
+
+    from predictor import list_available_models
+
+    available = list_available_models(both=True)
+    if not available:
+        st.error(
+            "No trained models found for both targets yet — go to the Train "
+            "page first."
+        )
+        return
+
+    if len(available) == 1:
+        model_choice = available[0]
+        st.caption(f"Model: **{_PREDICT_MODEL_LABELS[model_choice]}** (only one trained)")
+    else:
+        model_choice = st.radio(
+            "Which model?",
+            options=available,
+            format_func=lambda m: _PREDICT_MODEL_LABELS[m],
+            horizontal=True,
+        )
+
+    override_date = st.checkbox(
+        "Override the predicted draw date",
+        help="By default the next Tue/Thu/Sat after the latest draw in the "
+        "data is used. Turn this on if the real HKJC calendar deviates from "
+        "that usual cadence.",
+    )
+    date_value: str | None = None
+    if override_date:
+        picked = st.date_input("Draw date")
+        date_value = picked.isoformat()
+
+    penalize_last = st.checkbox(
+        "Penalize the last 3 extra numbers",
+        help="Lowers the ranking of the 3 most-recently-drawn extra numbers, "
+        "fading linearly (the most recent one discounted the most) — a "
+        "heuristic, not model signal.",
+    )
+
+    run_clicked = st.button("🔮 Run prediction", type="primary")
+
+    output: str | None = None
+    error: str | None = None
+
+    if run_clicked:
+        from predictor import predict
+
+        with st.spinner("Predicting…"):
+            buf = io.StringIO()
+            try:
+                with contextlib.redirect_stdout(buf):
+                    predict(
+                        model_name=model_choice,
+                        both=True,
+                        date=date_value,
+                        penalize_last=0.5 if penalize_last else None,
+                    )
+                output = buf.getvalue()
+            except Exception as exc:  # noqa: BLE001 — surface any pipeline failure to the page
+                error = str(exc)
+
+    if error:
+        st.error(f"Something went wrong: {error}")
+    elif output:
+        st.success("✅ Prediction done")
+        st.code(output, language=None)
+
+
 def _check_password(entered: str) -> bool:
     try:
         correct = st.secrets["data_password"]
@@ -274,5 +367,7 @@ if st.session_state.page == "data":
     render_data_page()
 elif st.session_state.page == "train":
     render_train_page()
+elif st.session_state.page == "predict":
+    render_predict_page()
 else:
     render_preprocess_page()
