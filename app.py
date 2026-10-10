@@ -1,11 +1,10 @@
 """Web front end for the Mark Six pipeline — no install, no command line.
 
 Deployed on a dedicated VPS, this lets anyone with the link click a button
-and get a prediction in their browser. Two pages, switched with the buttons
+to work the pipeline in their browser. Two pages, switched with the buttons
 at the top:
 
-- "Predict": shows a prediction from whatever model is already trained on
-  this server, or retrains from the current data snapshot.
+- "Preprocess": rebuilds data/features.csv from the current raw draws.
 - "Data": password-protected. Shows the most recent draws and lets you add
   or remove one by hand — scraping is blocked from this server's network
   and from the local dev machine (see STATUS.md), so this is the only way
@@ -25,21 +24,19 @@ ROOT = Path(__file__).parent
 SRC = ROOT / "src"
 sys.path.insert(0, str(SRC))
 
-MODELS_DIR = ROOT / "data" / "models"
-
 st.set_page_config(page_title="Mark Six Predictor", page_icon="🎱")
 
 if "page" not in st.session_state:
-    st.session_state.page = "predict"
+    st.session_state.page = "preprocess"
 
 nav_col1, nav_col2 = st.columns(2)
 with nav_col1:
     if st.button(
-        "🔮 Predict",
+        "⚙️ Preprocess",
         width="stretch",
-        type="primary" if st.session_state.page == "predict" else "secondary",
+        type="primary" if st.session_state.page == "preprocess" else "secondary",
     ):
-        st.session_state.page = "predict"
+        st.session_state.page = "preprocess"
 with nav_col2:
     if st.button(
         "📋 Data",
@@ -51,83 +48,38 @@ with nav_col2:
 st.divider()
 
 
-def _run(both: bool, retrain: bool) -> str:
-    buf = io.StringIO()
-    with contextlib.redirect_stdout(buf):
-        if retrain:
-            from preprocessing import preprocess
-            from models import train
-
-            print("=== Building features from current data ===")
-            preprocess()
-            print("\n=== Training model on full history (the slow part) ===")
-            train("xgb", full=True)
-        from predictor import predict
-
-        print("\n=== Predicting next draw ===")
-        predict(model_name="xgb", top_extra=10, top_main=10, both=both)
-    return buf.getvalue()
-
-
-def render_predict_page() -> None:
-    st.title("🎱 Mark Six Extra-Number Prediction")
+def render_preprocess_page() -> None:
+    st.title("⚙️ Build Features")
     st.caption(
-        "Statistical/ML prediction for the next Hong Kong Mark Six extra number. "
-        "Educational project — draws are independent, this is not a guarantee."
+        "Rebuilds data/features.csv from the current raw draws. Add new draws "
+        "on the Data page first if there are any."
     )
 
-    has_model = (MODELS_DIR / "extra_xgb.joblib").exists()
-
-    both = st.checkbox(
-        "Also predict the 6 main numbers (slower to retrain)",
-        value=False,
-        help="The project currently focuses on the extra number; main-number "
-        "prediction is available but roughly doubles retrain time.",
+    run_clicked = st.button(
+        "⚙️ Run preprocessing",
+        help="Takes a few seconds to a couple of minutes depending on history "
+        "size — please keep this tab open.",
     )
-
-    col1, col2 = st.columns(2)
-    with col1:
-        quick_clicked = st.button(
-            "🔮 Show prediction",
-            disabled=not has_model,
-            help="Uses the model already trained on this server.",
-        )
-    with col2:
-        retrain_clicked = st.button(
-            "🔁 Retrain from current data",
-            help="Rebuilds features and retrains from the current data snapshot. "
-            "Add new draws on the Data page first if there are any. Takes a "
-            "few minutes — please be patient and don't close the tab.",
-        )
-
-    if not has_model and not retrain_clicked:
-        st.info(
-            "No trained model on this server yet. Click **Retrain from current "
-            "data** to build one — only needed once, then it's saved for next "
-            "time. This takes a few minutes, please wait."
-        )
 
     output: str | None = None
     error: str | None = None
 
-    if retrain_clicked:
-        with st.spinner(
-            "Retraining — this can take a few minutes. Please keep this tab open."
-        ):
+    if run_clicked:
+        with st.spinner("Preprocessing…"):
+            from preprocessing import preprocess
+
+            buf = io.StringIO()
             try:
-                output = _run(both=both, retrain=True)
+                with contextlib.redirect_stdout(buf):
+                    preprocess()
+                output = buf.getvalue()
             except Exception as exc:  # noqa: BLE001 — surface any pipeline failure to the page
-                error = str(exc)
-    elif quick_clicked:
-        with st.spinner("Predicting…"):
-            try:
-                output = _run(both=both, retrain=False)
-            except Exception as exc:  # noqa: BLE001
                 error = str(exc)
 
     if error:
         st.error(f"Something went wrong: {error}")
-    if output:
+    elif output:
+        st.success("✅ Preprocess done")
         st.code(output, language=None)
 
 
@@ -221,4 +173,4 @@ def render_data_page() -> None:
 if st.session_state.page == "data":
     render_data_page()
 else:
-    render_predict_page()
+    render_preprocess_page()
