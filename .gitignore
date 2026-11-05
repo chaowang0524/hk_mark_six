@@ -17,3 +17,5 @@ data/reports/
 
 # Coding agent
 CLAUDE.md
+
+.streamlit/secrets.toml
