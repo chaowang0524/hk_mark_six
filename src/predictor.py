@@ -9,6 +9,7 @@ supporting statistics.
 from __future__ import annotations
 
 import re
+import subprocess
 from datetime import datetime
 from pathlib import Path
 
@@ -21,6 +22,20 @@ from preprocessing import POOL, build_features, load_raw
 
 REPORTS_DIR = Path(__file__).resolve().parent.parent / "data" / "reports"
 PREDICTION_LOG = Path(__file__).resolve().parent.parent / "data" / "prediction_log.csv"
+
+
+def _git_branch() -> str:
+    """Name of the git branch the code is running from, or 'unknown'."""
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=Path(__file__).resolve().parent,
+            capture_output=True, text=True, timeout=5, check=True,
+        )
+        return out.stdout.strip() or "unknown"
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+
 
 EXTRA_MODEL_FILES = {
     "rf": MODELS_DIR / "extra_rf.joblib",
@@ -477,6 +492,7 @@ def _render_combined_report(
         if main_used is not None:
             model_line += f"  main={main_used}"
         w(model_line)
+        w(f"Branch: {_git_branch()}")
         if penalty > 0.0:
             w(f"Recency penalty: {penalty} (discounts numbers drawn recently as extra)")
         if last_extra_penalized is not None:
@@ -532,6 +548,7 @@ def _render_combined_report(
         if main_used is not None:
             model_line += f"  正码={main_used}"
         w(model_line)
+        w(f"分支: {_git_branch()}")
         if penalty > 0.0:
             w(f"近期惩罚系数: {penalty}（对近期出现为特别号的号码降权）")
         if last_extra_penalized is not None:
